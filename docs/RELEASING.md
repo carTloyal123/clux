@@ -7,23 +7,34 @@
 1. Update the package version in `Cargo.toml`.
 2. Ensure `cargo fmt --check` and `cargo test -q` pass locally.
 3. Merge the release commit to `main`.
-4. Create an annotated tag:
-
-```bash
-git tag -a vX.Y.Z -m "vX.Y.Z"
-```
-
-5. Push the tag:
-
-```bash
-git push origin vX.Y.Z
-```
-
-6. Wait for the `Release` GitHub Actions workflow to finish.
-7. Verify the GitHub Release contains:
+4. Wait for the `CI` workflow on `main` to:
+   - create the annotated tag `vX.Y.Z` if it does not already exist
+   - invoke the release workflow in the same run
+5. Verify the GitHub Release contains:
    - `clux-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
    - `clux-server-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`
    - `SHA256SUMS`
+
+## Automatic Tagging And Release
+
+On pushes to `main`, the `CI` workflow checks `Cargo.toml` and computes `v<version>`.
+
+- If that tag does not exist yet, CI creates and pushes it.
+- CI then calls the release workflow directly and publishes the GitHub Release assets.
+- If the tag already exists, CI skips the automatic release path.
+
+This avoids relying on a second workflow triggered by the tag push itself.
+
+## Manual Release Fallback
+
+Manual tag pushes still work:
+
+```bash
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+That path uses the standalone `Release` workflow directly.
 
 ## Release Contract
 
@@ -48,6 +59,12 @@ The release workflow validates:
 - the package name is `clux`
 - `Cargo.toml` repository metadata is `https://github.com/carTloyal123/clux`
 
+The CI workflow also validates release readiness before it creates a tag:
+
+- tests pass on `main`
+- release-target cross-builds pass on `main`
+- the version tag does not already exist
+
 If any of these do not match, the release fails before any artifacts are published.
 
 ## Verifying A Release
@@ -68,4 +85,4 @@ clux --remote <host> new
 
 - check the failing GitHub Actions job logs
 - rerun the workflow only after fixing the build on `main`
-- push a corrected tag only after `Cargo.toml`, the git tag, and the intended release version all match
+- if CI already created the tag, keep `Cargo.toml` and the tag aligned when retrying or cutting the next release

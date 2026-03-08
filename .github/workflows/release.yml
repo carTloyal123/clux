@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,7 +35,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_call" ]]; then
+            tag="${{ inputs.tag }}"
+            requested_version="${{ inputs.version }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+            requested_version=""
+          fi
+
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
           name="$(sed -n 's/^name = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
           repository="$(sed -n 's/^repository = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
@@ -41,6 +56,11 @@ jobs:
 
           if [[ "${tag}" != "${expected_tag}" ]]; then
             echo "Tag ${tag} does not match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
+
+          if [[ -n "${requested_version}" && "${requested_version}" != "${version}" ]]; then
+            echo "Requested version ${requested_version} does not match Cargo.toml version ${version}" >&2
             exit 1
           fi
 
