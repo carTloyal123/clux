@@ -20,7 +20,8 @@
 On pushes to `main`, the `CI` workflow checks `Cargo.toml` and computes `v<version>`.
 
 - If that tag does not exist yet, CI creates and pushes it.
-- CI then calls the release workflow directly and publishes the GitHub Release assets.
+- CI builds the Linux release artifacts in a target matrix and uploads them as workflow artifacts.
+- CI then calls the release workflow directly and publishes the GitHub Release assets from those artifacts instead of rebuilding them.
 - If the tag already exists and the GitHub Release already exists, CI skips the automatic release path.
 - If the tag already exists but the GitHub Release is missing, CI republishes the release without changing the tag.
 
@@ -35,7 +36,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-That path uses the standalone `Release` workflow directly.
+That path uses the standalone `Release` workflow directly, and that workflow performs its own target-matrix builds because there is no prior CI artifact set to reuse.
 
 ## Release Contract
 

@@ -12,6 +12,10 @@ on:
       version:
         required: true
         type: string
+      reuse_ci_artifacts:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -92,6 +96,7 @@ jobs:
 
   build-server:
     name: Build ${{ matrix.target }}
+    if: ${{ github.event_name != 'workflow_call' || !inputs.reuse_ci_artifacts }}
     needs: validate-release
     runs-on: ubuntu-latest
 
@@ -173,6 +178,15 @@ jobs:
 
   publish-release:
     name: Publish release
+    if: >-
+      ${{
+        always() &&
+        needs.validate-release.result == 'success' &&
+        (
+          needs.build-server.result == 'success' ||
+          needs.build-server.result == 'skipped'
+        )
+      }}
     needs:
       - validate-release
       - build-server

@@ -31,8 +31,15 @@ jobs:
         run: cargo test -q
 
   build-release-targets:
-    name: Build release targets
+    name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
 
     steps:
       - name: Check out repository
@@ -49,11 +56,47 @@ jobs:
         with:
           tool: cross
 
-      - name: Build clux-server for x86_64-unknown-linux-gnu
-        run: cross build --release --bin clux-server --target x86_64-unknown-linux-gnu
+      - name: Build clux-server
+        run: cross build --release --bin clux-server --target ${{ matrix.target }}
 
-      - name: Build clux-server for aarch64-unknown-linux-gnu
-        run: cross build --release --bin clux-server --target aarch64-unknown-linux-gnu
+      - name: Package release artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          binary="target/${TARGET}/release/clux-server"
+          archive="clux-server-v${version}-${TARGET}.tar.gz"
+          staging_dir="$(mktemp -d)"
+
+          if [[ ! -f "${binary}" ]]; then
+            echo "Missing release binary at ${binary}" >&2
+            exit 1
+          fi
+
+          cp "${binary}" "${staging_dir}/clux-server"
+          chmod +x "${staging_dir}/clux-server"
+          tar -czf "${archive}" -C "${staging_dir}" clux-server
+
+          if [[ ! -f "${archive}" ]]; then
+            echo "Failed to create ${archive}" >&2
+            exit 1
+          fi
+
+          contents="$(tar -tzf "${archive}")"
+          if [[ "${contents}" != "clux-server" ]]; then
+            echo "Unexpected archive contents in ${archive}: ${contents}" >&2
+            exit 1
+          fi
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clux-server-${{ matrix.target }}
+          path: clux-server-v*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
 
   prepare-release:
     name: Prepare release
@@ -124,3 +167,4 @@ jobs:
     with:
       tag: ${{ needs.prepare-release.outputs.tag }}
       version: ${{ needs.prepare-release.outputs.version }}
+      reuse_ci_artifacts: true
