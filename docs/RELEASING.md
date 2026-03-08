@@ -21,7 +21,8 @@ On pushes to `main`, the `CI` workflow checks `Cargo.toml` and computes `v<versi
 
 - If that tag does not exist yet, CI creates and pushes it.
 - CI then calls the release workflow directly and publishes the GitHub Release assets.
-- If the tag already exists, CI skips the automatic release path.
+- If the tag already exists and the GitHub Release already exists, CI skips the automatic release path.
+- If the tag already exists but the GitHub Release is missing, CI republishes the release without changing the tag.
 
 This avoids relying on a second workflow triggered by the tag push itself.
 
