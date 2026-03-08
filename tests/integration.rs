@@ -634,7 +634,7 @@ fn populate_fake_bin_dir(
     options: &FakeSshOptions,
 ) -> Result<(), TestError> {
     for cmd in [
-        "mkdir", "mv", "chmod", "tar", "rm", "dirname", "nohup", "cp", "cat",
+        "mkdir", "mv", "chmod", "tar", "gzip", "rm", "dirname", "nohup", "cp", "cat",
     ] {
         let target = system_command_path(cmd)?;
         symlink(target, bin_dir.join(cmd))?;
