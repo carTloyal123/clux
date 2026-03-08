@@ -1,0 +1,91 @@
+[package]
+name = "clux"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A terminal multiplexer focused on UX: reliable hyperlinks, smooth scrollback, fast rendering"
+license = "MIT"
+repository = "https://github.com/carTloyal123/clux"
+
+[dependencies]
+# Terminal I/O, raw mode, events
+crossterm = "0.29"
+
+# PTY management on Unix
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "term", "fs", "signal"] }
+
+# ANSI escape sequence parser (from Alacritty)
+vte = "0.15"
+
+# Bitflags for cell attributes (with serde for protocol serialization)
+bitflags = { version = "2.4", features = ["serde"] }
+
+# Event loop (kqueue on macOS, epoll on Linux)
+mio = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4"
+
+# System clipboard
+arboard = "3.4"
+
+# Efficient bit vectors for damage tracking
+bitvec = "1.0"
+
+# Configuration file parsing
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+
+# Binary serialization for client-server protocol
+bincode = "1.3"
+
+# Platform-specific directories (for config file location)
+dirs = "5.0"
+
+# Path expansion (for ~ in config paths)
+shellexpand = "3.1"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Signal handling for server
+ctrlc = "3.4"
+
+[dev-dependencies]
+# Benchmarking
+criterion = "0.5"
+
+# Regex for test assertions
+regex = "1.10"
+
+[[bench]]
+name = "scrollback"
+harness = false
+
+[[bench]]
+name = "terminal"
+harness = false
+
+[[bench]]
+name = "grid"
+harness = false
+
+[[bin]]
+name = "clux"
+path = "src/bin/clux.rs"
+
+[[bin]]
+name = "clux-server"
+path = "src/bin/clux-server.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = true

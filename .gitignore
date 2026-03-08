@@ -1,0 +1,14 @@
+# Rust build artifacts
+target/
+
+# Logs
+*.log
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Optional local env
+.env
+.env.*
