@@ -7,9 +7,10 @@
 1. Ensure `cargo fmt --check` and `cargo test -q` pass locally.
 2. Merge to `main`.
 3. Wait for GitHub Actions to:
-   - auto-bump the patch version in `Cargo.toml` for normal merges
+   - run `CI` on the merged commit
+   - auto-bump the patch version inside that same workflow for normal merges
    - create the annotated tag `vX.Y.Z` if it does not already exist
-   - publish the GitHub Release assets for that tag
+   - build and publish the GitHub Release assets for that tag
 4. Verify the GitHub Release contains:
    - `clux-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
    - `clux-server-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`
@@ -19,25 +20,25 @@
 
 On pushes to `main`, the default path is:
 
-1. `Auto Bump Version` checks whether the merge already changed `Cargo.toml`'s package version.
-2. If the version did not change, it increments the patch version and pushes a bot-authored commit to `main`.
-3. The `CI` workflow checks `Cargo.toml` and computes `v<version>`.
-4. If that tag does not exist yet, CI creates and pushes it.
-5. CI publishes the GitHub Release assets for that version.
+1. `CI` runs tests on the merged commit.
+2. `Prepare release` checks whether the merge already changed `Cargo.toml`'s package version.
+3. If the version did not change, `Prepare release` increments the patch version, commits that change, and tags the new bot-authored commit.
+4. If the version did change, `Prepare release` preserves that explicit version and tags the merged commit.
+5. `CI` builds the release artifacts from the tagged ref and publishes the GitHub Release in the same workflow run.
 
-If the merged change already updated `Cargo.toml`'s version, the auto-bump workflow does nothing and CI releases exactly the version from the merged commit. That is the path to use for intentional major or minor releases.
+If the merged change already updated `Cargo.toml`'s version, `Prepare release` keeps that explicit version and CI releases exactly the version from the merged commit. That is the path to use for intentional major or minor releases.
 
 - CI builds the Linux release artifacts in a target matrix and uploads them as workflow artifacts.
 - If the tag already exists and the GitHub Release already exists, CI skips the automatic release path.
 - If the tag already exists but the GitHub Release is missing, CI republishes the release without changing the tag.
 
-This avoids relying on a second workflow triggered by the tag push itself.
+This avoids relying on a second workflow triggered by a bot-authored push or a tag push.
 
 ## Versioning Policy
 
 - Normal merges to `main` should not edit `Cargo.toml`; automation will bump the patch version.
 - Intentional major or minor releases should update `Cargo.toml` in the merged PR, and automation will preserve that explicit version.
-- The automation requires GitHub Actions to have permission to push to `main`. If branch protection is enabled, allow `github-actions[bot]` to bypass or satisfy that rule.
+- The automation requires GitHub Actions to have permission to push commits and tags to `main`. If branch protection is enabled, allow `github-actions[bot]` to bypass or satisfy that rule.
 
 ## Manual Release Fallback
 
