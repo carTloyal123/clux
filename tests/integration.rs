@@ -514,7 +514,7 @@ export PATH=\"{}\"\n\
 \n\
 if [ \"$#\" -gt 0 ] && [ \"$1\" = \"sh\" ]; then\n\
   shift\n\
-  if [ \"$#\" -gt 0 ] && [ \"$1\" = \"-lc\" ]; then\n\
+  if [ \"$#\" -gt 0 ] && ( [ \"$1\" = \"-c\" ] || [ \"$1\" = \"-lc\" ] ); then\n\
     shift\n\
     exec /bin/sh -c \"$@\"\n\
   fi\n\

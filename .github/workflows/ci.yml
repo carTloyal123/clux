@@ -160,11 +160,48 @@ jobs:
     name: Publish release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.prepare-release.outputs.should_release == 'true'
     needs:
+      - build-release-targets
       - prepare-release
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.prepare-release.outputs.tag }}
-      version: ${{ needs.prepare-release.outputs.version }}
-      reuse_ci_artifacts: true
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p release
+          for file in dist/*/*.tar.gz; do
+            mv "${file}" release/
+          done
+
+          count="$(find release -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')"
+          if [[ "${count}" != "2" ]]; then
+            echo "Expected 2 release archives, found ${count}" >&2
+            exit 1
+          fi
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release
+            sha256sum ./*.tar.gz > SHA256SUMS
+          )
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS

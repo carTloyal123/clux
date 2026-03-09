@@ -19,8 +19,8 @@ use crate::protocol::{ClientCapabilities, ClientMessage, ServerMessage, PROTOCOL
 use crate::server::default_socket_path;
 
 use self::remote::{
-    bootstrap_remote_server, start_remote_server, start_ssh_tunnel, wait_for_remote_socket,
-    SshTunnel,
+    bootstrap_remote_server, connect_remote_stdio_bridge, start_remote_server,
+    start_ssh_tunnel, wait_for_remote_socket, SshTunnel,
 };
 
 /// Where the client should connect.
@@ -210,6 +210,10 @@ impl Client {
         };
 
         if let Err(err) = client.handshake() {
+            if start_server && client.try_remote_stdio_fallback(&err)? {
+                client.handshake()?;
+                return Ok(client);
+            }
             let remote_no_autostart =
                 matches!(client.config.target, ClientTarget::RemoteSsh { .. }) && !start_server;
             if remote_no_autostart && is_connection_failure(&err) {
@@ -219,6 +223,28 @@ impl Client {
         }
 
         Ok(client)
+    }
+
+    fn try_remote_stdio_fallback(&mut self, err: &ClientError) -> ClientResult<bool> {
+        let (destination, socket_path) = match (&self.config.target, self.tunnel.is_some()) {
+            (
+                ClientTarget::RemoteSsh {
+                    destination,
+                    socket_path,
+                },
+                true,
+            ) if should_retry_remote_over_stdio(err) => (destination.clone(), socket_path.clone()),
+            _ => return Ok(false),
+        };
+
+        log::warn!(
+            "Remote handshake over SSH tunnel failed ({}), retrying with stdio bridge",
+            err
+        );
+        self.tunnel = None;
+        self.connection =
+            connect_remote_stdio_bridge(&destination, env!("CARGO_PKG_VERSION"), &socket_path)?;
+        Ok(true)
     }
 
     /// Connect to a local server with retry logic.
@@ -534,6 +560,15 @@ fn is_connection_failure(err: &ClientError) -> bool {
         ),
         _ => false,
     }
+}
+
+fn should_retry_remote_over_stdio(err: &ClientError) -> bool {
+    matches!(
+        err,
+        ClientError::Protocol(crate::protocol::ProtocolError::ConnectionClosed)
+            | ClientError::RemoteTunnelFailed(_)
+            | ClientError::RemoteStartupFailed(_)
+    )
 }
 
 #[cfg(test)]

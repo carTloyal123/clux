@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish, for example v0.1.0
+        required: true
+        type: string
+      version:
+        description: Cargo package version to validate against the tag
+        required: false
+        type: string
   workflow_call:
     inputs:
       tag:

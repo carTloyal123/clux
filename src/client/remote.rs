@@ -1,16 +1,17 @@
 //! Remote SSH transport helpers for the client.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{ClientError, ClientResult};
+use super::{connection::ServerConnection, ClientError, ClientResult};
 
 const TUNNEL_START_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_INSTALL_ROOT: &str = "~/.local/share/clux/server";
 const REMOTE_TMP_ROOT: &str = "~/.local/share/clux/server/.tmp";
+const REMOTE_STDIO_BRIDGE_NAME: &str = "clux-stdio-bridge";
 const DOWNLOAD_TOOL_MISSING_EXIT: i32 = 42;
 const BOOTSTRAP_FAILED_EXIT: i32 = 43;
 const ARTIFACT_UNAVAILABLE_EXIT: i32 = 44;
@@ -119,25 +120,32 @@ pub fn start_ssh_tunnel(
 /// Probe the remote OS and architecture.
 pub fn probe_remote_platform(destination: &str) -> ClientResult<RemotePlatform> {
     log::info!("Probing remote platform for {}", destination);
-    let output = run_remote_shell_capture(destination, "uname -s; uname -m", &[])?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let os = lines
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| {
-            ClientError::RemoteBootstrapFailed("remote platform probe returned no OS".to_string())
-        })?;
-    let arch = lines
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| {
-            ClientError::RemoteBootstrapFailed("remote platform probe returned no arch".to_string())
-        })?;
+    let output = run_remote_shell_capture(
+        destination,
+        concat!(
+            "printf 'CLUX_PROBE_OS=%s\\n' \"$(uname -s)\"\n",
+            "printf 'CLUX_PROBE_ARCH=%s\\n' \"$(uname -m)\"\n"
+        ),
+        &[],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("ssh exited with status {}", output.status)
+        };
+        return Err(ClientError::RemoteBootstrapFailed(format!(
+            "remote platform probe failed: {}",
+            details
+        )));
+    }
 
-    let platform = normalize_remote_platform(os, arch)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let platform = parse_remote_platform_probe(&stdout)?;
     log::info!(
         "Remote platform detected for {}: {}/{} -> {}",
         destination,
@@ -186,7 +194,7 @@ pub fn bootstrap_remote_server(destination: &str, version: &str) -> ClientResult
         version.to_string(),
         platform.target_triple.clone(),
     ];
-    let output = run_remote_shell(destination, script, &args)?;
+    let output = run_remote_shell(destination, &script, &args)?;
 
     match output.status.code() {
         Some(0) => {
@@ -273,7 +281,7 @@ pub fn start_remote_server(
         remote_socket_path.display().to_string(),
         server_bin_path.display().to_string(),
     ];
-    let output = run_remote_shell(destination, script, &args)?;
+    let output = run_remote_shell(destination, &script, &args)?;
 
     if output.status.success() {
         Ok(())
@@ -331,6 +339,41 @@ pub fn wait_for_remote_socket(destination: &str, remote_socket_path: &Path) -> C
     }
 }
 
+/// Connect to the remote server over SSH stdio via a small remote bridge helper.
+pub fn connect_remote_stdio_bridge(
+    destination: &str,
+    version: &str,
+    remote_socket_path: &Path,
+) -> ClientResult<ServerConnection> {
+    let bridge_path = remote_stdio_bridge_shell_path(version);
+    ensure_remote_stdio_bridge(destination, version)?;
+
+    log::info!(
+        "Starting SSH stdio bridge to {} for remote socket {} using {}",
+        destination,
+        remote_socket_path.display(),
+        bridge_path
+    );
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-T")
+        .arg(destination)
+        .arg(format!(
+            "exec \"{}\" \"{}\"",
+            bridge_path,
+            remote_socket_path.display()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = spawn_ssh(cmd)?;
+    ServerConnection::from_ssh_stdio_child(child).map_err(|err| match err {
+        crate::protocol::ProtocolError::Io(io_err) => ClientError::Io(io_err),
+        other => ClientError::RemoteTunnelFailed(other.to_string()),
+    })
+}
+
 fn run_remote_shell_capture(
     destination: &str,
     script: &str,
@@ -344,19 +387,87 @@ fn run_remote_shell(destination: &str, script: &str, args: &[String]) -> ClientR
     let mut ssh_args = vec![
         destination.to_string(),
         "sh".to_string(),
-        "-lc".to_string(),
-        script.to_string(),
-        "sh".to_string(),
+        "-s".to_string(),
+        "--".to_string(),
     ];
     ssh_args.extend(args.iter().cloned());
 
     cmd.args(ssh_args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = spawn_ssh(cmd)?;
+    let mut child = spawn_ssh(cmd)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes())?;
+    }
     child.wait_with_output().map_err(ClientError::Io)
+}
+
+fn ensure_remote_stdio_bridge(destination: &str, version: &str) -> ClientResult<()> {
+    let script = format!(
+        concat!(
+            "version=\"$1\"\n",
+            "bridge_path=\"$HOME/.local/share/clux/server/$version/{bridge_name}\"\n",
+            "mkdir -p \"$(dirname \"$bridge_path\")\" || exit 43\n",
+            "cat > \"$bridge_path\" <<'PY'\n",
+            "#!/usr/bin/env python3\n",
+            "import os\n",
+            "import selectors\n",
+            "import socket\n",
+            "import sys\n",
+            "\n",
+            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "sock.connect(sys.argv[1])\n",
+            "selector = selectors.DefaultSelector()\n",
+            "selector.register(0, selectors.EVENT_READ)\n",
+            "selector.register(sock, selectors.EVENT_READ)\n",
+            "stdin_open = True\n",
+            "\n",
+            "while True:\n",
+            "    for key, _ in selector.select():\n",
+            "        if key.fileobj == 0:\n",
+            "            data = os.read(0, 65536)\n",
+            "            if not data:\n",
+            "                if stdin_open:\n",
+            "                    stdin_open = False\n",
+            "                    selector.unregister(0)\n",
+            "                    try:\n",
+            "                        sock.shutdown(socket.SHUT_WR)\n",
+            "                    except OSError:\n",
+            "                        pass\n",
+            "            else:\n",
+            "                sock.sendall(data)\n",
+            "        else:\n",
+            "            data = sock.recv(65536)\n",
+            "            if not data:\n",
+            "                raise SystemExit(0)\n",
+            "            os.write(1, data)\n",
+            "PY\n",
+            "chmod +x \"$bridge_path\" || exit 43\n"
+        ),
+        bridge_name = REMOTE_STDIO_BRIDGE_NAME
+    );
+    let args = vec![version.to_string()];
+    let output = run_remote_shell(destination, &script, &args)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let details = if stderr.is_empty() {
+            "failed to install remote stdio bridge".to_string()
+        } else {
+            stderr
+        };
+        Err(ClientError::RemoteBootstrapFailed(details))
+    }
+}
+
+fn remote_stdio_bridge_shell_path(version: &str) -> String {
+    format!(
+        "$HOME/.local/share/clux/server/{}/{}",
+        version, REMOTE_STDIO_BRIDGE_NAME
+    )
 }
 
 fn spawn_ssh(mut cmd: Command) -> ClientResult<Child> {
@@ -433,6 +544,27 @@ fn normalize_remote_platform(os: &str, arch: &str) -> ClientResult<RemotePlatfor
         arch: arch.to_string(),
         target_triple: target_triple.to_string(),
     })
+}
+
+fn parse_remote_platform_probe(stdout: &str) -> ClientResult<RemotePlatform> {
+    let os = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("CLUX_PROBE_OS="))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| {
+            ClientError::RemoteBootstrapFailed("remote platform probe returned no OS".to_string())
+        })?;
+    let arch = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("CLUX_PROBE_ARCH="))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| {
+            ClientError::RemoteBootstrapFailed("remote platform probe returned no arch".to_string())
+        })?;
+
+    normalize_remote_platform(os, arch)
 }
 
 fn resolve_release_url_with_repo(repo: &str, version: &str, target: &str) -> ClientResult<String> {
@@ -567,6 +699,25 @@ mod tests {
     fn test_normalize_remote_platform_linux_arm64() {
         let platform = normalize_remote_platform("Linux", "arm64").unwrap();
         assert_eq!(platform.target_triple, "aarch64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn test_parse_remote_platform_probe_with_noise() {
+        let stdout = "warning from profile\nCLUX_PROBE_OS=Linux\nCLUX_PROBE_ARCH=x86_64\n";
+        let platform = parse_remote_platform_probe(stdout).unwrap();
+        assert_eq!(platform.os, "Linux");
+        assert_eq!(platform.arch, "x86_64");
+        assert_eq!(platform.target_triple, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn test_parse_remote_platform_probe_missing_arch() {
+        let err = parse_remote_platform_probe("CLUX_PROBE_OS=Linux\n").unwrap_err();
+        assert!(matches!(err, ClientError::RemoteBootstrapFailed(_)));
+        assert_eq!(
+            err.to_string(),
+            "Remote bootstrap failed: remote platform probe returned no arch"
+        );
     }
 
     #[test]
