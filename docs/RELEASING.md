@@ -4,28 +4,40 @@
 
 ## Release Checklist
 
-1. Update the package version in `Cargo.toml`.
-2. Ensure `cargo fmt --check` and `cargo test -q` pass locally.
-3. Merge the release commit to `main`.
-4. Wait for the `CI` workflow on `main` to:
+1. Ensure `cargo fmt --check` and `cargo test -q` pass locally.
+2. Merge to `main`.
+3. Wait for GitHub Actions to:
+   - auto-bump the patch version in `Cargo.toml` for normal merges
    - create the annotated tag `vX.Y.Z` if it does not already exist
-   - invoke the release workflow in the same run
-5. Verify the GitHub Release contains:
+   - publish the GitHub Release assets for that tag
+4. Verify the GitHub Release contains:
    - `clux-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
    - `clux-server-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`
    - `SHA256SUMS`
 
 ## Automatic Tagging And Release
 
-On pushes to `main`, the `CI` workflow checks `Cargo.toml` and computes `v<version>`.
+On pushes to `main`, the default path is:
 
-- If that tag does not exist yet, CI creates and pushes it.
+1. `Auto Bump Version` checks whether the merge already changed `Cargo.toml`'s package version.
+2. If the version did not change, it increments the patch version and pushes a bot-authored commit to `main`.
+3. The `CI` workflow checks `Cargo.toml` and computes `v<version>`.
+4. If that tag does not exist yet, CI creates and pushes it.
+5. CI publishes the GitHub Release assets for that version.
+
+If the merged change already updated `Cargo.toml`'s version, the auto-bump workflow does nothing and CI releases exactly the version from the merged commit. That is the path to use for intentional major or minor releases.
+
 - CI builds the Linux release artifacts in a target matrix and uploads them as workflow artifacts.
-- CI then calls the release workflow directly and publishes the GitHub Release assets from those artifacts instead of rebuilding them.
 - If the tag already exists and the GitHub Release already exists, CI skips the automatic release path.
 - If the tag already exists but the GitHub Release is missing, CI republishes the release without changing the tag.
 
 This avoids relying on a second workflow triggered by the tag push itself.
+
+## Versioning Policy
+
+- Normal merges to `main` should not edit `Cargo.toml`; automation will bump the patch version.
+- Intentional major or minor releases should update `Cargo.toml` in the merged PR, and automation will preserve that explicit version.
+- The automation requires GitHub Actions to have permission to push to `main`. If branch protection is enabled, allow `github-actions[bot]` to bypass or satisfy that rule.
 
 ## Manual Release Fallback
 

@@ -1,0 +1,98 @@
+name: Auto Bump Version
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-bump-main-version
+  cancel-in-progress: false
+
+jobs:
+  bump-patch:
+    name: Bump patch version on main
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Sync to latest main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
+      - name: Decide next version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "${current_version}" ]]; then
+            echo "Failed to parse package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          previous_version=""
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            previous_version="$(
+              git show HEAD^:Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n1
+            )"
+          fi
+
+          if [[ -n "${previous_version}" && "${previous_version}" != "${current_version}" ]]; then
+            echo "Version already changed on main (${previous_version} -> ${current_version}); skipping auto bump."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            echo "version=${current_version}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          IFS=. read -r major minor patch <<<"${current_version}"
+          if [[ -z "${major}" || -z "${minor}" || -z "${patch}" ]]; then
+            echo "Version ${current_version} is not a simple semver triplet" >&2
+            exit 1
+          fi
+
+          next_version="${major}.${minor}.$((patch + 1))"
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "version=${next_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Update Cargo.toml version
+        if: steps.version.outputs.skip != 'true'
+        shell: bash
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          perl -0pi -e 's/^version = ".*?"$/version = "'"${NEXT_VERSION}"'"/m' Cargo.toml
+
+      - name: Commit and push version bump
+        if: steps.version.outputs.skip != 'true'
+        shell: bash
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- Cargo.toml; then
+            echo "No version changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "Bump version to v${NEXT_VERSION}"
+          git push origin HEAD:main
