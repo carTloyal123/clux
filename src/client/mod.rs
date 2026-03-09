@@ -19,8 +19,8 @@ use crate::protocol::{ClientCapabilities, ClientMessage, ServerMessage, PROTOCOL
 use crate::server::default_socket_path;
 
 use self::remote::{
-    bootstrap_remote_server, connect_remote_stdio_bridge, start_remote_server,
-    start_ssh_tunnel, wait_for_remote_socket, SshTunnel,
+    bootstrap_remote_server, connect_remote_stdio_bridge, start_remote_server, start_ssh_tunnel,
+    wait_for_remote_socket, SshTunnel,
 };
 
 /// Where the client should connect.
