@@ -5,6 +5,7 @@
 
 mod client_conn;
 mod listener;
+pub mod stdio_bridge;
 
 pub use client_conn::{ClientConnection, ClientState};
 pub use listener::SocketListener;
@@ -22,8 +23,8 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::pane::PaneId;
 use crate::protocol::{
-    ClientMessage, CursorState, DetachReason, PaneLayout, PaneRow, ProtocolError, RenderedRow,
-    ServerMessage, WindowLayout, PROTOCOL_VERSION,
+    ClientMessage, CursorState, DetachReason, PaneLayout, PaneRow, ProtocolError, ServerMessage,
+    WindowLayout, PROTOCOL_VERSION,
 };
 use crate::pty::detect_shell;
 use crate::session::{ClientId, SessionId, SessionManager};
@@ -47,6 +48,13 @@ pub struct ServerConfig {
     /// Default terminal dimensions.
     pub default_cols: u16,
     pub default_rows: u16,
+    /// Turn URL-shaped text into real hyperlinks for the host terminal.
+    ///
+    /// Host terminals detect URLs against their own grid, where every clux row
+    /// looks like a hard-wrapped line, so they cannot follow a URL that wraps
+    /// inside a pane. Clux knows where its logical lines end, so it resolves
+    /// those links itself. See [`crate::urls`].
+    pub detect_plain_urls: bool,
 }
 
 impl Default for ServerConfig {
@@ -56,6 +64,7 @@ impl Default for ServerConfig {
             shell: detect_shell(),
             default_cols: 80,
             default_rows: 24,
+            detect_plain_urls: true,
         }
     }
 }
@@ -460,15 +469,9 @@ impl Server {
                 term_cols,
                 term_rows,
                 term_type: _,
-                capabilities,
             } => {
                 // Store client size
                 self.client_sizes.insert(client_id, (term_cols, term_rows));
-
-                // Store client capabilities
-                if let Some(client) = self.clients.get_mut(&client_id) {
-                    client.capabilities = capabilities;
-                }
 
                 // Send HelloAck
                 let response = ServerMessage::HelloAck {
@@ -510,6 +513,10 @@ impl Server {
 
             ClientMessage::Resize { cols, rows } => {
                 self.handle_resize(client_id, cols, rows)?;
+            }
+
+            ClientMessage::Scroll { lines } => {
+                self.handle_scroll(client_id, lines)?;
             }
 
             ClientMessage::Command(action) => {
@@ -627,28 +634,14 @@ impl Server {
             &ServerMessage::Attached {
                 session_id: session_id.0,
                 session_name: session_name.clone(),
-                needs_full_redraw: true,
             },
         )?;
 
-        // Send full screen to the client
-        // Check if client supports v2 protocol
-        let supports_v2 = self
-            .clients
-            .get(&client_id)
-            .map(|c| c.supports_pane_updates())
-            .unwrap_or(false);
-
-        if supports_v2 {
-            // Send v2 messages: LayoutChanged + PaneUpdate for each pane
-            if let Some(layout) = self.build_window_layout(session_id) {
-                let layout_msg = ServerMessage::LayoutChanged { layout };
-                self.send_to_client(client_id, &layout_msg)?;
-                self.send_all_pane_updates(session_id, &[client_id])?;
-            }
-        } else {
-            // Send v1 full screen
-            self.send_full_screen(client_id, session_id)?;
+        // Send the initial screen: layout, then every pane's content
+        if let Some(layout) = self.build_window_layout(session_id) {
+            let layout_msg = ServerMessage::LayoutChanged { layout };
+            self.send_to_client(client_id, &layout_msg)?;
+            self.send_all_pane_updates(session_id, &[client_id])?;
         }
 
         log::info!(
@@ -722,15 +715,108 @@ impl Server {
         };
 
         // Write to the focused pane's PTY
+        let mut left_scrollback = false;
         if let Some(session) = self.sessions.get_mut(session_id) {
             if let Some(pane) = session.window_manager.focused_pane_mut() {
+                // Typing returns to the live view, as in any terminal.
+                left_scrollback = pane.terminal.reset_scroll();
+
                 if let Err(e) = pane.pty.write_all(&bytes) {
                     log::warn!("Failed to write to PTY: {}", e);
                 }
             }
         }
 
+        if left_scrollback {
+            self.send_focused_pane_update(session_id)?;
+        }
+
         Ok(())
+    }
+
+    /// Scroll the focused pane through its scrollback.
+    ///
+    /// `lines` is positive to go back in history, negative to come forward, zero
+    /// to jump back to the live view.
+    fn handle_scroll(&mut self, client_id: ClientId, lines: i32) -> ServerResult<()> {
+        let session_id = match self.clients.get(&client_id).map(|c| c.state) {
+            Some(ClientState::Attached(id)) => id,
+            _ => return Ok(()),
+        };
+
+        let moved = match self.sessions.get_mut(session_id) {
+            Some(session) => match session.window_manager.focused_pane_mut() {
+                Some(pane) => {
+                    if lines == 0 {
+                        pane.terminal.reset_scroll()
+                    } else {
+                        pane.terminal.scroll_view(lines)
+                    }
+                }
+                None => false,
+            },
+            None => false,
+        };
+
+        if moved {
+            self.send_focused_pane_update(session_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Resend the focused pane to every attached client.
+    ///
+    /// Used when the view moved rather than the content: the whole pane is dirty,
+    /// and the cursor is hidden while looking at history.
+    fn send_focused_pane_update(&mut self, session_id: SessionId) -> ServerResult<()> {
+        let detect_plain_urls = self.config.detect_plain_urls;
+
+        let update = {
+            let Some(session) = self.sessions.get_mut(session_id) else {
+                return Ok(());
+            };
+            let Some(pane) = session.window_manager.focused_pane_mut() else {
+                return Ok(());
+            };
+
+            let rows_to_send = pane.terminal.take_dirty_rows();
+            if rows_to_send.is_empty() {
+                return Ok(());
+            }
+
+            let mut links =
+                pane.terminal
+                    .resolve_links(pane.id.0, detect_plain_urls, &rows_to_send);
+
+            let changed_rows: Vec<PaneRow> = rows_to_send
+                .iter()
+                .map(|&row_idx| {
+                    let view = pane.terminal.view_row(row_idx);
+                    let row_links = links
+                        .remove(&row_idx)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(Into::into)
+                        .collect();
+                    PaneRow::with_links(row_idx, view.cells, row_links).wrapped(view.wrapped)
+                })
+                .collect();
+
+            let cursor = pane.terminal.cursor();
+            ServerMessage::PaneUpdate {
+                pane_id: pane.id.0,
+                changed_rows,
+                cursor: Some(CursorState {
+                    row: cursor.row as u16,
+                    col: cursor.col as u16,
+                    // No cursor while viewing history: it belongs to the live view.
+                    visible: cursor.visible && !pane.terminal.is_scrolled(),
+                }),
+            }
+        };
+
+        self.broadcast_to_session(session_id, &update)
     }
 
     /// Handle terminal resize from a client.
@@ -1050,13 +1136,12 @@ impl Server {
 
         // Collect all data we need while holding mutable session borrow
         // Then drop the borrow before sending messages
-        use crate::cell::Cell;
-
         struct PtyEventData {
             mouse_mode_changed: Option<bool>,
-            v2_update: Option<ServerMessage>,
-            v1_update: Option<ServerMessage>,
+            pane_update: Option<ServerMessage>,
         }
+
+        let detect_plain_urls = self.config.detect_plain_urls;
 
         let event_data = {
             let mut buf = [0u8; 4096];
@@ -1068,8 +1153,6 @@ impl Server {
                 }
             };
 
-            // Get screen dimensions and focused pane info
-            let screen_cols = session.window_manager.cols() as usize;
             let focused_pane_id = session.window_manager.focused_pane_id();
 
             // Find the pane and read from its PTY
@@ -1138,81 +1221,49 @@ impl Server {
             // Get cursor state from terminal
             let cursor = pane.terminal.cursor();
 
-            // Build v2 cursor state (pane-local coordinates)
-            let v2_cursor = if pane_id == focused_pane_id {
+            // Cursor state in pane-local coordinates
+            let pane_cursor = if pane_id == focused_pane_id {
                 Some(CursorState {
                     row: cursor.row as u16,
                     col: cursor.col as u16,
                     visible: cursor.visible,
-                    shape: crate::protocol::CursorShape::Block,
                 })
             } else {
                 None
             };
 
-            // Build pane-local rows for v2 protocol (cells without screen offset)
-            let v2_changed_rows: Vec<PaneRow> = dirty_rows
+            // Resolve hyperlinks for the dirty rows. This can pull in extra rows:
+            // when a link wraps, every row it covers has to be repainted or the
+            // host terminal keeps the fragment it was given before the line grew.
+            let mut links = pane
+                .terminal
+                .resolve_links(pane_id.0, detect_plain_urls, &dirty_rows);
+            let rows_to_send = rows_with_links(&dirty_rows, &links);
+
+            // Pane-local rows (cells without screen offset)
+            let changed_rows: Vec<PaneRow> = rows_to_send
                 .iter()
                 .map(|&row_idx| {
-                    let cells = pane.terminal.get_row_cells(row_idx);
-                    PaneRow::new(row_idx, cells)
+                    let view = pane.terminal.view_row(row_idx);
+                    let row_links = links
+                        .remove(&row_idx)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(Into::into)
+                        .collect();
+                    PaneRow::with_links(row_idx, view.cells, row_links).wrapped(view.wrapped)
                 })
                 .collect();
 
-            let v2_update = ServerMessage::PaneUpdate {
+            let pane_update = ServerMessage::PaneUpdate {
                 pane_id: pane_id.0,
-                changed_rows: v2_changed_rows,
-                cursor: v2_cursor,
-            };
-
-            // Build v1 Update (composited screen coordinates)
-            let v1_changed_rows: Vec<(u16, RenderedRow)> = dirty_rows
-                .iter()
-                .map(|&row_idx| {
-                    let cells = pane.terminal.get_row_cells(row_idx);
-
-                    // Build a full-width row with cells at the pane's x offset
-                    let mut full_row: Vec<Cell> = vec![Cell::default(); screen_cols];
-                    for (col_idx, cell) in cells.into_iter().enumerate() {
-                        let screen_x = pane_rect.x as usize + col_idx;
-                        if screen_x < screen_cols {
-                            full_row[screen_x] = cell;
-                        }
-                    }
-
-                    // Calculate the screen row index (offset by pane's y position)
-                    let screen_row_idx = pane_rect.y + row_idx;
-                    (screen_row_idx, RenderedRow::new(cells_to_ansi(&full_row)))
-                })
-                .collect();
-
-            // Get cursor state with screen coordinates
-            let v1_cursor = if pane_id == focused_pane_id {
-                CursorState {
-                    row: pane_rect.y + cursor.row as u16,
-                    col: pane_rect.x + cursor.col as u16,
-                    visible: cursor.visible,
-                    shape: crate::protocol::CursorShape::Block,
-                }
-            } else {
-                CursorState {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                    shape: crate::protocol::CursorShape::Block,
-                }
-            };
-
-            let v1_update = ServerMessage::Update {
-                changed_rows: v1_changed_rows,
-                cursor: v1_cursor,
-                status_line: None,
+                changed_rows,
+                cursor: pane_cursor,
             };
 
             PtyEventData {
                 mouse_mode_changed,
-                v2_update: Some(v2_update),
-                v1_update: Some(v1_update),
+                pane_update: Some(pane_update),
             }
         }; // session borrow ends here
 
@@ -1222,37 +1273,16 @@ impl Server {
             self.broadcast_to_session(session_id, &mouse_msg)?;
         }
 
-        // Partition clients by capability
-        let mut v1_clients: Vec<ClientId> = Vec::new();
-        let mut v2_clients: Vec<ClientId> = Vec::new();
+        if let Some(ref pane_update) = event_data.pane_update {
+            let attached: Vec<ClientId> = self
+                .clients
+                .iter()
+                .filter(|(_, client)| client.state == ClientState::Attached(session_id))
+                .map(|(&id, _)| id)
+                .collect();
 
-        for (&id, client) in &self.clients {
-            if let ClientState::Attached(sid) = client.state {
-                if sid == session_id {
-                    if client.supports_pane_updates() {
-                        v2_clients.push(id);
-                    } else {
-                        v1_clients.push(id);
-                    }
-                }
-            }
-        }
-
-        // Send v2 PaneUpdate to new clients (pane-local coordinates)
-        if !v2_clients.is_empty() {
-            if let Some(ref pane_update) = event_data.v2_update {
-                for client_id in v2_clients {
-                    self.send_to_client(client_id, pane_update)?;
-                }
-            }
-        }
-
-        // Send v1 Update to legacy clients (composited screen coordinates)
-        if !v1_clients.is_empty() {
-            if let Some(ref update) = event_data.v1_update {
-                for client_id in v1_clients {
-                    self.send_to_client(client_id, update)?;
-                }
+            for client_id in attached {
+                self.send_to_client(client_id, pane_update)?;
             }
         }
 
@@ -1378,39 +1408,24 @@ impl Server {
 
     /// Broadcast a full screen update to all clients attached to a session.
     fn broadcast_full_screen(&mut self, session_id: SessionId) -> ServerResult<()> {
-        // Collect client IDs attached to this session, partitioned by v2 capability
-        let mut v1_clients: Vec<ClientId> = Vec::new();
-        let mut v2_clients: Vec<ClientId> = Vec::new();
+        let clients: Vec<ClientId> = self
+            .clients
+            .iter()
+            .filter(|(_, client)| client.state == ClientState::Attached(session_id))
+            .map(|(&id, _)| id)
+            .collect();
 
-        for (&id, client) in &self.clients {
-            if let ClientState::Attached(sid) = client.state {
-                if sid == session_id {
-                    if client.supports_pane_updates() {
-                        v2_clients.push(id);
-                    } else {
-                        v1_clients.push(id);
-                    }
-                }
-            }
+        if clients.is_empty() {
+            return Ok(());
         }
 
-        // For v2 clients, send LayoutChanged and then full pane content
-        if !v2_clients.is_empty() {
-            // Build and send layout
-            if let Some(layout) = self.build_window_layout(session_id) {
-                let layout_msg = ServerMessage::LayoutChanged { layout };
-                for &client_id in &v2_clients {
-                    self.send_to_client(client_id, &layout_msg)?;
-                }
-
-                // Send full pane content for each pane
-                self.send_all_pane_updates(session_id, &v2_clients)?;
+        if let Some(layout) = self.build_window_layout(session_id) {
+            let layout_msg = ServerMessage::LayoutChanged { layout };
+            for &client_id in &clients {
+                self.send_to_client(client_id, &layout_msg)?;
             }
-        }
 
-        // For v1 clients, send composited full screen
-        for client_id in v1_clients {
-            self.send_full_screen(client_id, session_id)?;
+            self.send_all_pane_updates(session_id, &clients)?;
         }
 
         Ok(())
@@ -1444,12 +1459,14 @@ impl Server {
         })
     }
 
-    /// Send full pane content updates to v2 clients.
+    /// Send full pane content updates to the given clients.
     fn send_all_pane_updates(
         &mut self,
         session_id: SessionId,
         client_ids: &[ClientId],
     ) -> ServerResult<()> {
+        let detect_plain_urls = self.config.detect_plain_urls;
+
         // Collect all pane updates first while holding immutable session borrow
         let updates: Vec<ServerMessage> = {
             let session = match self.sessions.get(session_id) {
@@ -1468,11 +1485,24 @@ impl Server {
                 .map(|pane| {
                     let term_rows = pane.terminal.rows();
                     let rows_to_send = std::cmp::min(pane.rect.height as usize, term_rows);
+                    let all_rows: Vec<u16> = (0..rows_to_send as u16).collect();
 
-                    let changed_rows: Vec<PaneRow> = (0..rows_to_send)
-                        .map(|row_idx| {
-                            let cells = pane.terminal.get_row_cells(row_idx as u16);
-                            PaneRow::new(row_idx as u16, cells)
+                    let mut links =
+                        pane.terminal
+                            .resolve_links(pane.id.0, detect_plain_urls, &all_rows);
+
+                    let changed_rows: Vec<PaneRow> = all_rows
+                        .iter()
+                        .map(|&row_idx| {
+                            let view = pane.terminal.view_row(row_idx);
+                            let row_links = links
+                                .remove(&row_idx)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(Into::into)
+                                .collect();
+                            PaneRow::with_links(row_idx, view.cells, row_links)
+                                .wrapped(view.wrapped)
                         })
                         .collect();
 
@@ -1483,7 +1513,6 @@ impl Server {
                             row: c.row as u16,
                             col: c.col as u16,
                             visible: c.visible,
-                            shape: crate::protocol::CursorShape::Block,
                         })
                     } else {
                         None
@@ -1506,159 +1535,6 @@ impl Server {
         }
 
         Ok(())
-    }
-
-    /// Send a full screen update to a client.
-    /// Composites all panes in the active window into a single screen buffer.
-    fn send_full_screen(&mut self, client_id: ClientId, session_id: SessionId) -> ServerResult<()> {
-        log::info!(
-            "send_full_screen: client={:?}, session={:?}",
-            client_id,
-            session_id
-        );
-
-        let session = match self.sessions.get(session_id) {
-            Some(s) => s,
-            None => {
-                log::warn!("send_full_screen: session {:?} not found", session_id);
-                return Ok(());
-            }
-        };
-
-        let wm = &session.window_manager;
-        let screen_cols = wm.cols() as usize;
-        let screen_rows = wm.rows() as usize;
-
-        log::info!(
-            "send_full_screen: screen size {}x{}, {} panes in active window",
-            screen_cols,
-            screen_rows,
-            wm.active_pane_count()
-        );
-
-        // Create a screen buffer filled with default (space) cells
-        use crate::cell::Cell;
-        let mut screen: Vec<Vec<Cell>> = vec![vec![Cell::default(); screen_cols]; screen_rows];
-
-        // Get focused pane for cursor position calculation
-        let focused_pane_id = wm.focused_pane_id();
-        let mut cursor_state = CursorState::default();
-
-        // Render each pane into the screen buffer with full styling
-        let active_window = wm.active_window();
-        for pane in active_window.pane_manager.all_panes() {
-            let rect = pane.rect;
-            let term_rows = pane.terminal.rows();
-            let term_cols = pane.terminal.cols();
-            log::debug!(
-                "Rendering pane {:?} at ({}, {}) size {}x{}, terminal={}x{}",
-                pane.id,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                term_cols,
-                term_rows
-            );
-
-            // Use the minimum of rect height and terminal rows
-            let rows_to_render = std::cmp::min(rect.height as usize, term_rows);
-
-            // Render each row of this pane with full styling
-            for row_idx in 0..rows_to_render {
-                let screen_y = rect.y as usize + row_idx;
-                if screen_y >= screen_rows {
-                    break;
-                }
-
-                // Get styled cells from the terminal
-                let cells = pane.terminal.get_row_cells(row_idx as u16);
-
-                for (col_idx, cell) in cells.into_iter().enumerate() {
-                    let screen_x = rect.x as usize + col_idx;
-                    if screen_x >= screen_cols {
-                        break;
-                    }
-                    screen[screen_y][screen_x] = cell;
-                }
-            }
-
-            // Calculate cursor position for focused pane
-            if pane.id == focused_pane_id {
-                let cursor = pane.terminal.cursor();
-                cursor_state = CursorState {
-                    row: rect.y + cursor.row as u16,
-                    col: rect.x + cursor.col as u16,
-                    visible: cursor.visible,
-                    shape: crate::protocol::CursorShape::Block,
-                };
-            }
-        }
-
-        // Draw dividers between panes (vertical lines for vertical splits)
-        // Find panes and draw borders at their edges
-        let panes: Vec<_> = active_window.pane_manager.all_panes();
-        if panes.len() > 1 {
-            // Draw vertical dividers (between side-by-side panes)
-            for pane in &panes {
-                let rect = pane.rect;
-                // If this pane doesn't start at x=0, draw a vertical divider to its left
-                if rect.x > 0 {
-                    let divider_x = (rect.x - 1) as usize;
-                    if divider_x < screen_cols {
-                        for y in rect.y as usize..(rect.y + rect.height) as usize {
-                            if y < screen_rows {
-                                screen[y][divider_x].c = '│';
-                            }
-                        }
-                    }
-                }
-                // If this pane doesn't start at y=0, draw a horizontal divider above it
-                if rect.y > 0 {
-                    let divider_y = (rect.y - 1) as usize;
-                    if divider_y < screen_rows {
-                        for x in rect.x as usize..(rect.x + rect.width) as usize {
-                            if x < screen_cols {
-                                screen[divider_y][x].c = '─';
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Draw intersection characters where dividers meet
-            for pane in &panes {
-                let rect = pane.rect;
-                if rect.x > 0 && rect.y > 0 {
-                    let ix = (rect.x - 1) as usize;
-                    let iy = (rect.y - 1) as usize;
-                    if ix < screen_cols && iy < screen_rows {
-                        screen[iy][ix].c = '┼';
-                    }
-                }
-            }
-        }
-
-        // Convert screen buffer to RenderedRows with ANSI formatting
-        let rows: Vec<RenderedRow> = screen
-            .into_iter()
-            .map(|row| RenderedRow::new(cells_to_ansi(&row)))
-            .collect();
-
-        log::info!(
-            "send_full_screen: rendered {} rows, cursor at ({}, {})",
-            rows.len(),
-            cursor_state.col,
-            cursor_state.row
-        );
-
-        let message = ServerMessage::FullScreen {
-            rows,
-            cursor: cursor_state,
-            status_line: String::new(), // TODO: build status line from windows
-        };
-
-        self.send_to_client(client_id, &message)
     }
 
     /// Send a message to a specific client.
@@ -1757,94 +1633,21 @@ impl Drop for Server {
     }
 }
 
-/// Convert a row of styled cells to an ANSI-formatted string.
-fn cells_to_ansi(cells: &[crate::cell::Cell]) -> String {
-    use crate::cell::{CellFlags, Color, ColorKind};
-
-    let mut output = String::new();
-    let mut last_fg = Color::default();
-    let mut last_bg = Color::default();
-    let mut last_flags = CellFlags::empty();
-
-    for cell in cells {
-        // Check if style changed
-        if cell.fg != last_fg || cell.bg != last_bg || cell.flags != last_flags {
-            // Reset and apply new style
-            output.push_str("\x1b[0m");
-
-            // Apply foreground color
-            match cell.fg.kind {
-                ColorKind::Default => {}
-                ColorKind::Indexed => {
-                    let n = cell.fg.r;
-                    if n < 8 {
-                        output.push_str(&format!("\x1b[{}m", 30 + n));
-                    } else if n < 16 {
-                        output.push_str(&format!("\x1b[{}m", 90 + n - 8));
-                    } else {
-                        output.push_str(&format!("\x1b[38;5;{}m", n));
-                    }
-                }
-                ColorKind::Rgb => {
-                    output.push_str(&format!(
-                        "\x1b[38;2;{};{};{}m",
-                        cell.fg.r, cell.fg.g, cell.fg.b
-                    ));
-                }
-            }
-
-            // Apply background color
-            match cell.bg.kind {
-                ColorKind::Default => {}
-                ColorKind::Indexed => {
-                    let n = cell.bg.r;
-                    if n < 8 {
-                        output.push_str(&format!("\x1b[{}m", 40 + n));
-                    } else if n < 16 {
-                        output.push_str(&format!("\x1b[{}m", 100 + n - 8));
-                    } else {
-                        output.push_str(&format!("\x1b[48;5;{}m", n));
-                    }
-                }
-                ColorKind::Rgb => {
-                    output.push_str(&format!(
-                        "\x1b[48;2;{};{};{}m",
-                        cell.bg.r, cell.bg.g, cell.bg.b
-                    ));
-                }
-            }
-
-            // Apply flags
-            if cell.flags.contains(CellFlags::BOLD) {
-                output.push_str("\x1b[1m");
-            }
-            if cell.flags.contains(CellFlags::DIM) {
-                output.push_str("\x1b[2m");
-            }
-            if cell.flags.contains(CellFlags::ITALIC) {
-                output.push_str("\x1b[3m");
-            }
-            if cell.flags.contains(CellFlags::UNDERLINE) {
-                output.push_str("\x1b[4m");
-            }
-            if cell.flags.contains(CellFlags::INVERSE) {
-                output.push_str("\x1b[7m");
-            }
-            if cell.flags.contains(CellFlags::STRIKETHROUGH) {
-                output.push_str("\x1b[9m");
-            }
-
-            last_fg = cell.fg;
-            last_bg = cell.bg;
-            last_flags = cell.flags;
+/// The rows a pane update has to carry: the dirty rows plus any extra row a
+/// resolved link reaches onto.
+fn rows_with_links(
+    dirty_rows: &[u16],
+    links: &std::collections::HashMap<u16, Vec<crate::urls::LinkRun>>,
+) -> Vec<u16> {
+    let mut rows: Vec<u16> = dirty_rows.to_vec();
+    for &row in links.keys() {
+        if !rows.contains(&row) {
+            rows.push(row);
         }
-
-        output.push(cell.c);
     }
-
-    // Reset at end of row
-    output.push_str("\x1b[0m");
-    output
+    rows.sort_unstable();
+    rows.dedup();
+    rows
 }
 
 /// Helper to get a short description of a server message for logging.
@@ -1853,8 +1656,6 @@ fn message_type(msg: &ServerMessage) -> &'static str {
         ServerMessage::HelloAck { .. } => "HelloAck",
         ServerMessage::Attached { .. } => "Attached",
         ServerMessage::Detached { .. } => "Detached",
-        ServerMessage::FullScreen { .. } => "FullScreen",
-        ServerMessage::Update { .. } => "Update",
         ServerMessage::SessionList(_) => "SessionList",
         ServerMessage::Error { .. } => "Error",
         ServerMessage::Pong => "Pong",
@@ -1961,7 +1762,6 @@ mod tests {
             term_cols: 80,
             term_rows: 24,
             term_type: "xterm-256color".to_string(),
-            capabilities: None,
         };
         write_message(&mut client_stream, &hello).unwrap();
 
@@ -2018,7 +1818,6 @@ mod tests {
             term_cols: 80,
             term_rows: 24,
             term_type: "xterm".to_string(),
-            capabilities: None,
         };
         write_message(&mut client_stream, &hello).unwrap();
         thread::sleep(Duration::from_millis(10));

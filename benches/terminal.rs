@@ -180,7 +180,7 @@ fn bench_scroll_view(c: &mut Criterion) {
     group.bench_function("scroll_up", |b| {
         b.iter(|| {
             term.scroll_view(black_box(-10));
-            term.scroll_to_bottom();
+            term.reset_scroll();
         });
     });
 

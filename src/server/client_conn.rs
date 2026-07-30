@@ -8,8 +8,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use crate::protocol::{
-    write_message, ClientCapabilities, ClientMessage, MessageReader, ProtocolError, ProtocolResult,
-    ServerMessage,
+    write_message, ClientMessage, MessageReader, ProtocolError, ProtocolResult, ServerMessage,
 };
 use crate::session::{ClientId, SessionId};
 
@@ -36,8 +35,6 @@ pub struct ClientConnection {
     reader: MessageReader,
     /// Whether the connection is still alive.
     alive: bool,
-    /// Client capabilities (set after Hello handshake).
-    pub capabilities: Option<ClientCapabilities>,
 }
 
 impl ClientConnection {
@@ -54,21 +51,12 @@ impl ClientConnection {
             state: ClientState::Connected,
             reader: MessageReader::new(),
             alive: true,
-            capabilities: None,
         }
     }
 
     /// Check if the connection is still alive.
     pub fn is_alive(&self) -> bool {
         self.alive
-    }
-
-    /// Check if this client supports pane updates (v2 protocol).
-    pub fn supports_pane_updates(&self) -> bool {
-        self.capabilities
-            .as_ref()
-            .map(|c| c.supports_pane_updates)
-            .unwrap_or(false)
     }
 
     /// Try to read a complete message from the client.
@@ -213,7 +201,6 @@ mod tests {
             term_cols: 80,
             term_rows: 24,
             term_type: "xterm".to_string(),
-            capabilities: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();

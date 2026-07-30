@@ -146,6 +146,10 @@ pub struct Config {
     pub keybindings: KeybindingsConfig,
     #[serde(default)]
     pub server: ServerLoggingConfig,
+    #[serde(default)]
+    pub links: LinksConfig,
+    #[serde(default)]
+    pub selection: SelectionConfig,
 }
 
 impl Default for Config {
@@ -154,7 +158,50 @@ impl Default for Config {
             prefix: PrefixConfig::default(),
             keybindings: KeybindingsConfig::default(),
             server: ServerLoggingConfig::default(),
+            links: LinksConfig::default(),
+            selection: SelectionConfig::default(),
         }
+    }
+}
+
+/// Mouse selection configuration.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct SelectionConfig {
+    /// Copy to the clipboard as soon as the mouse button is released.
+    ///
+    /// Clux enables mouse reporting, so the host terminal's own selection is not
+    /// available inside a session - selecting has to do something useful on its
+    /// own. Set to false if you would rather copy explicitly.
+    pub copy_on_select: bool,
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        Self {
+            copy_on_select: true,
+        }
+    }
+}
+
+/// Hyperlink configuration.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct LinksConfig {
+    /// Turn URL-shaped text into real OSC 8 hyperlinks for the host terminal.
+    ///
+    /// Host terminals match URLs against their own grid, where every row clux
+    /// paints looks like a hard-wrapped line, so they cannot follow a URL that
+    /// wraps inside a pane and will happily run a match across a pane divider.
+    /// Clux is the only process that knows where its logical lines end, so it
+    /// resolves those links itself. Set to false to leave detection to the host
+    /// terminal.
+    pub auto_detect: bool,
+}
+
+impl Default for LinksConfig {
+    fn default() -> Self {
+        Self { auto_detect: true }
     }
 }
 
@@ -431,11 +478,6 @@ impl Config {
         let contents = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
-    }
-
-    /// Get the default configuration as a TOML string.
-    pub fn default_toml() -> &'static str {
-        DEFAULT_CONFIG
     }
 
     /// Display the configuration for debugging.

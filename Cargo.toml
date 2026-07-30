@@ -29,9 +29,6 @@ log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
 
-# System clipboard
-arboard = "3.4"
-
 # Efficient bit vectors for damage tracking
 bitvec = "1.0"
 
@@ -63,15 +60,11 @@ criterion = "0.5"
 regex = "1.10"
 
 [[bench]]
-name = "scrollback"
-harness = false
-
-[[bench]]
 name = "terminal"
 harness = false
 
 [[bench]]
-name = "grid"
+name = "buffer"
 harness = false
 
 [[bin]]

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use clux::client::{Client, ClientConfig, ClientTarget, ScreenBuffer};
 use clux::protocol::{CommandAction, Direction, ServerMessage, WindowLayout};
+use clux::selection::SelectionMode;
 
 static SSH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -140,6 +141,14 @@ impl TestClient {
         self.command(CommandAction::SplitVertical)
     }
 
+    /// Scroll the focused pane: positive back in history, 0 returns to live.
+    pub fn scroll(&mut self, lines: i32) -> &mut Self {
+        if let Err(e) = self.client.send_scroll(lines) {
+            eprintln!("Failed to send scroll: {}", e);
+        }
+        self
+    }
+
     pub fn close_pane(&mut self) -> &mut Self {
         self.command(CommandAction::ClosePane)
     }
@@ -246,6 +255,37 @@ impl TestClient {
         self.screen.layout().map(|l| l.panes.len()).unwrap_or(1)
     }
 
+    /// The ANSI the client would write for one screen row, hyperlinks included.
+    pub fn render_row_ansi(&self, row_idx: usize) -> String {
+        self.screen.render_row_ansi(row_idx)
+    }
+
+    /// Every screen row's ANSI, joined - what the host terminal actually sees.
+    pub fn render_screen_ansi(&self) -> String {
+        let (_cols, rows) = self.screen.dimensions();
+        (0..rows)
+            .map(|row| self.screen.render_row_ansi(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Hyperlink at a screen position, if any.
+    pub fn link_at(&self, row: usize, col: usize) -> Option<String> {
+        self.screen.link_at(row, col).map(str::to_string)
+    }
+
+    pub fn screen_dimensions(&self) -> (usize, usize) {
+        self.screen.dimensions()
+    }
+
+    /// Drag-select between two screen positions and return the copied text.
+    pub fn select_text(&mut self, from: (usize, usize), to: (usize, usize)) -> Option<String> {
+        self.screen
+            .begin_selection(from.0, from.1, SelectionMode::Normal);
+        self.screen.extend_selection(to.0, to.1);
+        self.screen.selected_text()
+    }
+
     pub fn dump_screen(&self) -> String {
         let capture = self.capture();
         format!(
@@ -285,9 +325,6 @@ impl TestClient {
                 cursor: _,
             } => {
                 self.screen.apply_pane_update(pane_id, &changed_rows);
-            }
-            ServerMessage::FullScreen { .. } | ServerMessage::Update { .. } => {
-                // V1 fallback - ignored in test client
             }
             ServerMessage::Detached { .. } | ServerMessage::Shutdown => {}
             _ => {}
@@ -381,18 +418,100 @@ fn unique_socket_path() -> PathBuf {
 }
 
 fn start_server(socket_path: &PathBuf) -> Result<Child, TestError> {
+    start_server_with_auto_exit(socket_path, false)
+}
+
+/// Start a server, optionally leaving session-driven auto-shutdown enabled.
+///
+/// Most tests pass `false` so the server cannot vanish mid-test; the lifecycle
+/// tests pass `true` because auto-shutdown is what they are checking.
+fn start_server_with_auto_exit(socket_path: &PathBuf, auto_exit: bool) -> Result<Child, TestError> {
     let server_bin = env!("CARGO_BIN_EXE_clux-server");
 
-    let child = Command::new(server_bin)
-        .arg("--socket")
-        .arg(socket_path)
-        .arg("--no-auto-exit")
+    let mut command = Command::new(server_bin);
+    command.arg("--socket").arg(socket_path);
+    if !auto_exit {
+        command.arg("--no-auto-exit");
+    }
+
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
 
     Ok(child)
+}
+
+/// A client attached straight to a socket, with no server started for it.
+fn attach_client(
+    socket_path: &PathBuf,
+    session: &str,
+    create: bool,
+    start_server: bool,
+) -> Result<Client, TestError> {
+    let mut config = ClientConfig::default();
+    config.target = ClientTarget::Local {
+        socket_path: socket_path.clone(),
+    };
+    config.term_cols = 80;
+    config.term_rows = 24;
+
+    let mut client =
+        Client::connect(config, start_server).map_err(|e| TestError::Client(e.to_string()))?;
+    client
+        .attach(Some(session.to_string()), create)
+        .map_err(|e| TestError::Client(e.to_string()))?;
+
+    Ok(client)
+}
+
+/// Drain messages until `text` shows up in a pane update, or time out.
+fn wait_for_text_on(client: &mut Client, text: &str, timeout: Duration) -> Result<(), TestError> {
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        while let Ok(Some(msg)) = client.try_recv() {
+            if let ServerMessage::PaneUpdate { changed_rows, .. } = msg {
+                for row in &changed_rows {
+                    let row_text: String = row.cells.iter().map(|c| c.c).collect();
+                    if row_text.contains(text) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    Err(TestError::Timeout)
+}
+
+/// Keep draining server messages for a while, as a real client's loop does.
+///
+/// This matters: the server writes to clients synchronously, so a client that
+/// stops reading stalls it.
+fn drain_for(client: &mut Client, duration: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        while matches!(client.try_recv(), Ok(Some(_))) {}
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Wait for a process to exit on its own.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> bool {
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+
+    false
 }
 
 fn wait_for_socket(socket_path: &PathBuf, timeout: Duration) -> Result<(), TestError> {
@@ -464,7 +583,7 @@ impl FakeSshEnv {
         let artifact_path = temp_dir.join("artifact.tar.gz");
         let download_count_path = temp_dir.join("download-count");
         let ssh_path = temp_dir.join("ssh");
-        let bridge_bin = env!("CARGO_BIN_EXE_clux-ssh-bridge");
+        let bridge_bin = env!("CARGO_BIN_EXE_clux-test-forwarder");
         std::fs::create_dir_all(&home_dir)?;
         std::fs::create_dir_all(&bin_dir)?;
 
@@ -939,6 +1058,511 @@ fn test_type_in_split_pane() {
     client
         .wait_for_text("PANEB_OUTPUT")
         .expect("Should see output in split pane");
+}
+
+// ============================================================================
+// Server Lifecycle Tests
+// ============================================================================
+//
+// The contract: a client starts the server on first use, the server outlives a
+// detach so sessions can be reattached, and it shuts itself down once the last
+// session is gone.
+
+#[test]
+fn test_client_starts_the_server_on_first_use() {
+    let socket_path = unique_socket_path();
+    assert!(!socket_path.exists(), "socket should not exist yet");
+
+    // The client looks for clux-server beside its own executable and otherwise on
+    // PATH. Under `cargo test` the running executable is the test binary in
+    // deps/, so PATH is what resolves it.
+    let _env_guard = SSH_ENV_LOCK.lock().unwrap();
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_clux-server"))
+        .parent()
+        .expect("bin dir")
+        .to_path_buf();
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), original_path));
+
+    let client = attach_client(&socket_path, "spawned", true, true);
+    std::env::set_var("PATH", original_path);
+
+    let mut client = client.expect("client should have started a server and attached");
+    assert!(
+        socket_path.exists(),
+        "server socket should exist after the client started it"
+    );
+    assert!(client.is_attached());
+
+    // The server we started is nobody else's to clean up.
+    let _ = client.shutdown_server();
+    thread::sleep(Duration::from_millis(300));
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[test]
+fn test_server_survives_detach_and_session_reattaches() {
+    let socket_path = unique_socket_path();
+    // Auto-shutdown left on: a detached session must keep the server alive.
+    let mut server = start_server_with_auto_exit(&socket_path, true).expect("start server");
+    wait_for_socket(&socket_path, Duration::from_secs(5)).expect("socket");
+
+    {
+        let mut first = attach_client(&socket_path, "persistent", true, false).expect("attach");
+        drain_for(&mut first, Duration::from_millis(500));
+        first
+            .send_input(b"echo SURVIVED_DETACH\n".to_vec())
+            .expect("send input");
+        wait_for_text_on(&mut first, "SURVIVED_DETACH", Duration::from_secs(10))
+            .expect("should see output before detaching");
+        first.detach().expect("detach");
+    }
+
+    // Well past the auto-shutdown grace period: the session still exists, so the
+    // server must not have exited.
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        matches!(server.try_wait(), Ok(None)),
+        "server exited while a detached session still existed"
+    );
+
+    let mut second =
+        attach_client(&socket_path, "persistent", false, false).expect("reattach to session");
+    wait_for_text_on(&mut second, "SURVIVED_DETACH", Duration::from_secs(10))
+        .expect("reattached session should still hold its output");
+
+    let _ = second.shutdown_server();
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[test]
+fn test_server_exits_after_last_session_closes() {
+    let socket_path = unique_socket_path();
+    let mut server = start_server_with_auto_exit(&socket_path, true).expect("start server");
+    wait_for_socket(&socket_path, Duration::from_secs(5)).expect("socket");
+
+    {
+        let mut client = attach_client(&socket_path, "transient", true, false).expect("attach");
+        drain_for(&mut client, Duration::from_millis(500));
+
+        // Quit closes the session, unlike detach.
+        client.send_command(CommandAction::Quit).expect("quit");
+        drain_for(&mut client, Duration::from_millis(300));
+    }
+
+    assert!(
+        wait_for_exit(&mut server, Duration::from_secs(10)),
+        "server should shut down once its last session closed"
+    );
+
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[test]
+fn test_server_exits_when_the_last_shell_exits() {
+    // The everyday path: no quit command, the user just types `exit`.
+    let socket_path = unique_socket_path();
+    let mut server = start_server_with_auto_exit(&socket_path, true).expect("start server");
+    wait_for_socket(&socket_path, Duration::from_secs(5)).expect("socket");
+
+    {
+        let mut client = attach_client(&socket_path, "shell-exit", true, false).expect("attach");
+        drain_for(&mut client, Duration::from_millis(500));
+        client.send_input(b"exit\n".to_vec()).expect("send exit");
+        drain_for(&mut client, Duration::from_millis(500));
+    }
+
+    assert!(
+        wait_for_exit(&mut server, Duration::from_secs(10)),
+        "server should shut down after the last shell exited"
+    );
+
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+// ============================================================================
+// Scrollback Tests
+// ============================================================================
+
+#[test]
+fn test_scrolling_back_shows_history_and_returning_shows_live_output() {
+    let mut client = TestClient::new()
+        .size(80, 24)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    // Push well past a screen of output so there is real history.
+    client.type_text("for i in $(seq 1 80); do echo \"LINE_$i\"; done\n");
+    client
+        .wait_for_text("LINE_80")
+        .expect("should see the last line");
+    std::thread::sleep(Duration::from_millis(300));
+    client.drain_messages().ok();
+
+    let live = client.capture().as_text();
+    assert!(live.contains("LINE_80"), "live view should show the tail");
+    assert!(
+        !live.contains("LINE_1\n") && !live.contains("LINE_2\n"),
+        "early lines should have scrolled off:\n{}",
+        live
+    );
+
+    // Scroll back a full screen.
+    client.scroll(30);
+    client
+        .wait_for_text("LINE_50")
+        .expect("scrolled view should reveal earlier output");
+
+    let scrolled = client.capture().as_text();
+    assert!(
+        !scrolled.contains("LINE_80"),
+        "scrolled view should no longer show the tail:\n{}",
+        scrolled
+    );
+
+    // Back to the live view.
+    client.scroll(0);
+    client
+        .wait_for_text("LINE_80")
+        .expect("returning to live should show the tail again");
+}
+
+#[test]
+fn test_links_still_work_after_scrolling_back_to_them() {
+    let mut client = TestClient::new()
+        .size(80, 24)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    // Print a URL, then push it off the top of the screen.
+    client.type_text("printf 'go to https://example.com/in-history now\\n'\n");
+    client
+        .wait_for_text("https://example.com/in-history")
+        .expect("should see the URL");
+    client.type_text("for i in $(seq 1 40); do echo \"FILLER_$i\"; done\n");
+    client.wait_for_text("FILLER_40").expect("filler output");
+    std::thread::sleep(Duration::from_millis(300));
+    client.drain_messages().ok();
+
+    let live = hyperlinks_by_row(&client);
+    assert!(
+        !live.iter().any(|(_, _, url)| url.contains("in-history")),
+        "the URL should have scrolled off the live view: {live:?}"
+    );
+
+    // Scroll back to it: the link must come back with the text.
+    client.scroll(30);
+    client
+        .wait_for_text("https://example.com/in-history")
+        .expect("scrolling back should reveal the URL again");
+    std::thread::sleep(Duration::from_millis(200));
+    client.drain_messages().ok();
+
+    let scrolled = hyperlinks_by_row(&client);
+    assert!(
+        scrolled
+            .iter()
+            .any(|(_, _, url)| url == "https://example.com/in-history"),
+        "a URL scrolled back into view should still be a hyperlink; links were {scrolled:?}\n{}",
+        client.dump_screen()
+    );
+}
+
+#[test]
+fn test_typing_returns_to_the_live_view() {
+    let mut client = TestClient::new()
+        .size(80, 24)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    client.type_text("for i in $(seq 1 60); do echo \"ROW_$i\"; done\n");
+    client.wait_for_text("ROW_60").expect("initial output");
+    std::thread::sleep(Duration::from_millis(300));
+    client.drain_messages().ok();
+
+    client.scroll(25);
+    client
+        .wait_for_text("ROW_20")
+        .expect("scrolled view should show earlier output");
+
+    // Typing anything snaps back to the live view.
+    client.type_text("echo BACK_TO_LIVE\n");
+    client
+        .wait_for_text("BACK_TO_LIVE")
+        .expect("typing should return to the live view and show the result");
+}
+
+// ============================================================================
+// Selection / Copy Tests
+// ============================================================================
+
+#[test]
+fn test_selection_copies_a_wrapped_path_as_one_line() {
+    // The whole point of shipping the soft-wrap flag: a path too long for the
+    // pane must copy back without a newline spliced into it.
+    let mut client = TestClient::new()
+        .size(40, 24)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    let path = "/tmp/a/deliberately/long/path/that/will/not/fit/in/one/row.txt";
+    assert!(path.len() > 40, "path must be wider than the pane");
+
+    client.type_text(&format!("printf '{}\\n'\n", path));
+    client
+        .wait_for_text("/tmp/a/deliberately")
+        .expect("Should see the start of the path");
+    std::thread::sleep(Duration::from_millis(300));
+    client.drain_messages().ok();
+
+    // Select the whole pane; the wrapped rows must join.
+    let (cols, rows) = client.screen_dimensions();
+    let copied = client
+        .select_text((0, 0), (rows - 1, cols - 1))
+        .expect("selection should produce text");
+
+    assert!(
+        copied.contains(path),
+        "wrapped path came back broken\ncopied:\n{}\n{}",
+        copied,
+        client.dump_screen()
+    );
+}
+
+#[test]
+fn test_selection_is_confined_to_one_pane() {
+    let mut client = TestClient::new()
+        .size(80, 24)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    client.type_text("printf 'LEFTSIDE\\n'\n");
+    client.wait_for_text("LEFTSIDE").expect("left pane output");
+
+    client.split_vertical();
+    client
+        .wait_until(|s| s.layout().map(|l| l.panes.len() >= 2).unwrap_or(false))
+        .expect("wait for 2 panes");
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    client.type_text("printf 'RIGHTSIDE\\n'\n");
+    client
+        .wait_for_text("RIGHTSIDE")
+        .expect("right pane output");
+    std::thread::sleep(Duration::from_millis(300));
+    client.drain_messages().ok();
+
+    // Drag from the left pane across the divider into the right one.
+    let (cols, rows) = client.screen_dimensions();
+    let copied = client
+        .select_text((0, 0), (rows - 1, cols - 1))
+        .expect("selection should produce text");
+
+    assert!(
+        copied.contains("LEFTSIDE"),
+        "selection lost its own pane's text\n{}",
+        client.dump_screen()
+    );
+    assert!(
+        !copied.contains("RIGHTSIDE"),
+        "selection crossed into the other pane\ncopied:\n{}\n{}",
+        copied,
+        client.dump_screen()
+    );
+    assert!(
+        !copied.contains('│'),
+        "selection included the pane divider\ncopied:\n{}",
+        copied
+    );
+}
+
+// ============================================================================
+// Hyperlink Tests
+// ============================================================================
+
+/// The OSC 8 open sequences in one row's ANSI, as (id, url) pairs.
+fn hyperlinks_in(ansi: &str) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+
+    for chunk in ansi.split("\x1b]8;").skip(1) {
+        let Some(body) = chunk.split("\x1b\\").next() else {
+            continue;
+        };
+        // "id=<id>;<url>" for an open, "" or ";" for a close.
+        let Some((params, url)) = body.split_once(';') else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        let id = params.strip_prefix("id=").unwrap_or(params).to_string();
+        links.push((id, url.to_string()));
+    }
+
+    links
+}
+
+/// Every hyperlink the client would emit, as (row, id, url).
+fn hyperlinks_by_row(client: &TestClient) -> Vec<(usize, String, String)> {
+    let (_cols, rows) = client.screen_dimensions();
+    (0..rows)
+        .flat_map(|row| {
+            hyperlinks_in(&client.render_row_ansi(row))
+                .into_iter()
+                .map(move |(id, url)| (row, id, url))
+        })
+        .collect()
+}
+
+#[test]
+fn test_plain_url_becomes_a_real_hyperlink() {
+    let mut client = TestClient::new()
+        .size(80, 24)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    client.type_text("printf 'go to https://example.com/plain now\\n'\n");
+    client
+        .wait_for_text("https://example.com/plain")
+        .expect("Should see the URL text");
+
+    let links = hyperlinks_in(&client.render_screen_ansi());
+    assert!(
+        links
+            .iter()
+            .any(|(_, url)| url == "https://example.com/plain"),
+        "no OSC 8 hyperlink for the printed URL; links were {links:?}\n{}",
+        client.dump_screen()
+    );
+    // The link must stop at the URL, not swallow the surrounding words.
+    for (_, url) in &links {
+        assert!(!url.contains("now"), "link ran into the prose: {url:?}");
+        assert!(!url.contains("go"), "link ran into the prose: {url:?}");
+    }
+
+    // A URL clux detected itself is underlined so it reads as a link.
+    let underlined = (0..client.screen_dimensions().1).any(|row| {
+        let ansi = client.render_row_ansi(row);
+        ansi.contains("https://example.com/plain") && ansi.contains("\x1b[0;4m")
+    });
+    assert!(
+        underlined,
+        "detected URL was not underlined\n{}",
+        client.dump_screen()
+    );
+}
+
+#[test]
+fn test_wrapped_url_is_one_link_across_rows() {
+    // Narrow pane so the URL has to wrap: this is the case a host terminal
+    // cannot resolve on its own, because every row clux paints looks unwrapped.
+    let mut client = TestClient::new()
+        .size(40, 24)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    let url = "https://example.com/a/quite/long/path/that/must/wrap?q=1";
+    assert!(url.len() > 40, "test URL must be wider than the pane");
+    client.type_text(&format!("printf '{}\\n'\n", url));
+    client
+        .wait_for_text("https://example.com/a/quite")
+        .expect("Should see the start of the URL");
+    // Give the tail row time to arrive as well.
+    std::thread::sleep(Duration::from_millis(300));
+    client.drain_messages().ok();
+
+    // The URL shows up twice (the echoed command line and the output), and each
+    // occurrence is its own link, so group by id before asserting.
+    let links = hyperlinks_by_row(&client);
+    let mut rows_by_id: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (row, id, found) in &links {
+        if found == url {
+            rows_by_id.entry(id).or_default().push(*row);
+        }
+    }
+
+    assert!(
+        !rows_by_id.is_empty(),
+        "wrapped URL produced no hyperlink; links were {links:?}\n{}",
+        client.dump_screen()
+    );
+
+    let spans_rows = rows_by_id.values().find(|rows| rows.len() >= 2);
+    let rows = spans_rows.unwrap_or_else(|| {
+        panic!(
+            "no link covered more than one row, so the wrap broke it: {rows_by_id:?}\n{}",
+            client.dump_screen()
+        )
+    });
+
+    // Its rows must be adjacent - it is one wrapped line, not two matches.
+    let mut sorted = rows.clone();
+    sorted.sort();
+    assert!(
+        sorted.windows(2).all(|w| w[1] == w[0] + 1),
+        "link rows are not adjacent: {sorted:?}"
+    );
+}
+
+#[test]
+fn test_application_osc8_hyperlink_reaches_the_host_terminal() {
+    // The case tmux drops on Ghostty: the app emits OSC 8 itself.
+    let mut client = TestClient::new()
+        .size(80, 24)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create test client");
+
+    std::thread::sleep(Duration::from_millis(500));
+    client.drain_messages().ok();
+
+    client.type_text(
+        "printf '\\033]8;;https://example.com/osc8\\033\\\\CLICKME\\033]8;;\\033\\\\\\n'\n",
+    );
+    client
+        .wait_for_text("CLICKME")
+        .expect("Should see the link text");
+
+    let links = hyperlinks_in(&client.render_screen_ansi());
+    assert!(
+        links
+            .iter()
+            .any(|(_, url)| url == "https://example.com/osc8"),
+        "application OSC 8 hyperlink was dropped; links were {links:?}\n{}",
+        client.dump_screen()
+    );
 }
 
 // ============================================================================

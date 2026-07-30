@@ -1,14 +1,13 @@
-//! Text selection for copy/paste.
+//! Text selection geometry for copy.
 //!
-//! Handles mouse-based text selection across the visible grid
-//! and scrollback buffer.
+//! Coordinates are client screen coordinates: the client owns selection, because
+//! it owns the composited screen and the mouse events. Text extraction lives with
+//! the screen buffer (`client::screen`), which knows pane rects and soft wraps.
+//! See docs/SELECTION.md.
 
-// This module will be fully used in Phase 2 (mouse selection)
-#![allow(dead_code)]
+// Word/Line modes and find_word_bounds land with double- and triple-click.
 
 use crate::cell::Cell;
-use crate::grid::Grid;
-use crate::scrollback::Scrollback;
 
 /// A point in the terminal (can be in visible area or scrollback).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,11 +22,6 @@ pub struct Point {
 impl Point {
     pub fn new(line: i32, col: usize) -> Self {
         Self { line, col }
-    }
-
-    /// Check if this point is in the scrollback area.
-    pub fn is_scrollback(&self) -> bool {
-        self.line < 0
     }
 }
 
@@ -130,68 +124,6 @@ impl Selection {
         }
     }
 
-    /// Extract selected text from grid and scrollback.
-    pub fn extract_text(
-        &self,
-        grid: &Grid,
-        scrollback: &Scrollback,
-        scroll_offset: usize,
-    ) -> String {
-        let (start, end) = self.normalized();
-        let mut result = String::new();
-        let cols = grid.cols();
-
-        for line in start.line..=end.line {
-            if !result.is_empty() && self.mode != SelectionMode::Block {
-                result.push('\n');
-            }
-
-            let (start_col, end_col) = match self.mode {
-                SelectionMode::Block => (start.col.min(end.col), start.col.max(end.col)),
-                SelectionMode::Line => (0, cols.saturating_sub(1)),
-                _ => {
-                    let sc = if line == start.line { start.col } else { 0 };
-                    let ec = if line == end.line {
-                        end.col
-                    } else {
-                        cols.saturating_sub(1)
-                    };
-                    (sc, ec)
-                }
-            };
-
-            // Get cells for this line
-            let line_text = if line < 0 {
-                // Scrollback
-                let sb_offset = (-line - 1) as usize + scroll_offset;
-                if let Some(sb_line) = scrollback.get(sb_offset) {
-                    extract_cells_text(sb_line.cells(), start_col, end_col)
-                } else {
-                    String::new()
-                }
-            } else {
-                // Visible grid
-                let row = line as usize;
-                if let Some(grid_row) = grid.row(row) {
-                    let cells: Vec<Cell> =
-                        (0..cols).filter_map(|c| grid_row.get(c).copied()).collect();
-                    extract_cells_text(&cells, start_col, end_col)
-                } else {
-                    String::new()
-                }
-            };
-
-            result.push_str(&line_text);
-        }
-
-        // Trim trailing whitespace from each line for cleaner output
-        result
-            .lines()
-            .map(|l| l.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// Clear the selection.
     pub fn clear(&mut self) {
         self.active = false;
@@ -201,16 +133,6 @@ impl Selection {
     pub fn is_empty(&self) -> bool {
         self.start == self.end
     }
-}
-
-/// Extract text from a slice of cells between columns.
-fn extract_cells_text(cells: &[Cell], start_col: usize, end_col: usize) -> String {
-    cells
-        .iter()
-        .skip(start_col)
-        .take(end_col - start_col + 1)
-        .map(|c| c.c)
-        .collect()
 }
 
 /// Detect word boundaries for double-click selection.

@@ -19,6 +19,7 @@ fn main() -> anyhow::Result<()> {
     let mut socket_path: Option<PathBuf> = None;
     let mut debug = false;
     let mut no_auto_exit = false;
+    let mut stdio_bridge: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -40,6 +41,15 @@ fn main() -> anyhow::Result<()> {
                 no_auto_exit = true;
                 i += 1;
             }
+            "--stdio-bridge" => {
+                if i + 1 < args.len() {
+                    stdio_bridge = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    eprintln!("Error: --stdio-bridge requires an argument");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -54,6 +64,13 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Bridge mode: no server, no logging setup - just pump the socket. Used by the
+    // client when ssh cannot forward a Unix socket. Keep this before anything that
+    // writes to stdout, which belongs to the bridged connection.
+    if let Some(socket) = stdio_bridge {
+        return clux::server::stdio_bridge::run(&socket).map_err(Into::into);
     }
 
     // Load configuration for logging settings
@@ -76,9 +93,10 @@ fn main() -> anyhow::Result<()> {
     }
     log::debug!("Debug logging enabled");
 
-    // Build config
+    // Build config (shadows the user config loaded above)
     let config = ServerConfig {
         socket_path: socket_path.unwrap_or_else(default_socket_path),
+        detect_plain_urls: config.links.auto_detect,
         ..Default::default()
     };
 

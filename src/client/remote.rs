@@ -11,7 +11,6 @@ const TUNNEL_START_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_INSTALL_ROOT: &str = "~/.local/share/clux/server";
 const REMOTE_TMP_ROOT: &str = "~/.local/share/clux/server/.tmp";
-const REMOTE_STDIO_BRIDGE_NAME: &str = "clux-stdio-bridge";
 const DOWNLOAD_TOOL_MISSING_EXIT: i32 = 42;
 const BOOTSTRAP_FAILED_EXIT: i32 = 43;
 const ARTIFACT_UNAVAILABLE_EXIT: i32 = 44;
@@ -339,28 +338,33 @@ pub fn wait_for_remote_socket(destination: &str, remote_socket_path: &Path) -> C
     }
 }
 
-/// Connect to the remote server over SSH stdio via a small remote bridge helper.
+/// Connect to the remote server over SSH stdio, used when ssh cannot forward a
+/// Unix socket.
+///
+/// The remote end is `clux-server --stdio-bridge`, which the bootstrap has already
+/// installed - there is no separate helper to install.
 pub fn connect_remote_stdio_bridge(
     destination: &str,
     version: &str,
     remote_socket_path: &Path,
 ) -> ClientResult<ServerConnection> {
-    let bridge_path = remote_stdio_bridge_shell_path(version);
-    ensure_remote_stdio_bridge(destination, version)?;
+    // Idempotent: reuses the existing install and just reports its path.
+    let bootstrap = bootstrap_remote_server(destination, version)?;
+    let server_path = bootstrap.binary_path;
 
     log::info!(
         "Starting SSH stdio bridge to {} for remote socket {} using {}",
         destination,
         remote_socket_path.display(),
-        bridge_path
+        server_path.display()
     );
 
     let mut cmd = Command::new("ssh");
     cmd.arg("-T")
         .arg(destination)
         .arg(format!(
-            "exec \"{}\" \"{}\"",
-            bridge_path,
+            "exec \"{}\" --stdio-bridge \"{}\"",
+            server_path.display(),
             remote_socket_path.display()
         ))
         .stdin(Stdio::piped())
@@ -402,72 +406,6 @@ fn run_remote_shell(destination: &str, script: &str, args: &[String]) -> ClientR
         stdin.write_all(script.as_bytes())?;
     }
     child.wait_with_output().map_err(ClientError::Io)
-}
-
-fn ensure_remote_stdio_bridge(destination: &str, version: &str) -> ClientResult<()> {
-    let script = format!(
-        concat!(
-            "version=\"$1\"\n",
-            "bridge_path=\"$HOME/.local/share/clux/server/$version/{bridge_name}\"\n",
-            "mkdir -p \"$(dirname \"$bridge_path\")\" || exit 43\n",
-            "cat > \"$bridge_path\" <<'PY'\n",
-            "#!/usr/bin/env python3\n",
-            "import os\n",
-            "import selectors\n",
-            "import socket\n",
-            "import sys\n",
-            "\n",
-            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
-            "sock.connect(sys.argv[1])\n",
-            "selector = selectors.DefaultSelector()\n",
-            "selector.register(0, selectors.EVENT_READ)\n",
-            "selector.register(sock, selectors.EVENT_READ)\n",
-            "stdin_open = True\n",
-            "\n",
-            "while True:\n",
-            "    for key, _ in selector.select():\n",
-            "        if key.fileobj == 0:\n",
-            "            data = os.read(0, 65536)\n",
-            "            if not data:\n",
-            "                if stdin_open:\n",
-            "                    stdin_open = False\n",
-            "                    selector.unregister(0)\n",
-            "                    try:\n",
-            "                        sock.shutdown(socket.SHUT_WR)\n",
-            "                    except OSError:\n",
-            "                        pass\n",
-            "            else:\n",
-            "                sock.sendall(data)\n",
-            "        else:\n",
-            "            data = sock.recv(65536)\n",
-            "            if not data:\n",
-            "                raise SystemExit(0)\n",
-            "            os.write(1, data)\n",
-            "PY\n",
-            "chmod +x \"$bridge_path\" || exit 43\n"
-        ),
-        bridge_name = REMOTE_STDIO_BRIDGE_NAME
-    );
-    let args = vec![version.to_string()];
-    let output = run_remote_shell(destination, &script, &args)?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let details = if stderr.is_empty() {
-            "failed to install remote stdio bridge".to_string()
-        } else {
-            stderr
-        };
-        Err(ClientError::RemoteBootstrapFailed(details))
-    }
-}
-
-fn remote_stdio_bridge_shell_path(version: &str) -> String {
-    format!(
-        "$HOME/.local/share/clux/server/{}/{}",
-        version, REMOTE_STDIO_BRIDGE_NAME
-    )
 }
 
 fn spawn_ssh(mut cmd: Command) -> ClientResult<Child> {

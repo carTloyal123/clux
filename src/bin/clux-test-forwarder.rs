@@ -1,4 +1,8 @@
-//! Test helper that forwards a local Unix socket to another Unix socket.
+//! Test fixture: forwards a local Unix socket to another Unix socket.
+//!
+//! The remote-SSH tests use this as a stand-in for `ssh -L localsock:remotesock`.
+//! It is not part of the product and is not shipped in releases. The production
+//! stdio fallback is `clux-server --stdio-bridge`.
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -7,7 +11,7 @@ use std::path::Path;
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
-        anyhow::bail!("usage: clux-ssh-bridge <local-socket> <remote-socket>");
+        anyhow::bail!("usage: clux-test-forwarder <local-socket> <remote-socket>");
     }
 
     let local_socket = &args[1];

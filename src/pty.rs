@@ -3,9 +3,6 @@
 //! Handles creating PTYs, spawning shells, and communication with child processes.
 //! Uses the nix crate for Unix PTY operations.
 
-// Some methods are kept for future use / API completeness
-#![allow(dead_code)]
-
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
@@ -174,16 +171,6 @@ impl Pty {
                 Err(nix::Error::EINTR) => continue, // Interrupted by signal, retry
                 Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
             }
-        }
-    }
-
-    /// Try to read bytes without blocking.
-    /// Returns None if no data is available.
-    pub fn try_read(&mut self, buf: &mut [u8]) -> Option<usize> {
-        match self.read(buf) {
-            Ok(0) => None,
-            Ok(n) => Some(n),
-            Err(_) => None,
         }
     }
 

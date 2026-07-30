@@ -21,7 +21,17 @@ use crate::cell::Cell;
 /// Protocol version for compatibility checking.
 /// Version 2 adds PaneUpdate/LayoutChanged messages for hybrid rendering.
 /// Version 3 adds ShutdownServer for clean server termination.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 4 adds hyperlink runs to PaneRow (bincode is not self-describing, so
+/// adding the field is a wire break).
+/// Version 5 drops the pre-PaneUpdate rendering path: no more FullScreen/Update
+/// messages, no capability negotiation - every client composites pane updates.
+/// Version 6 adds the soft-wrap flag to PaneRow, so the client can join wrapped
+/// rows when extracting selected text.
+/// Version 7 drops speculative fields nothing implemented: cursor shape (always
+/// Block, never parsed from DECSCUSR) and Attached::needs_full_redraw (always
+/// true, ignored by the client).
+/// Version 8 adds Scroll for scrollback navigation.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Maximum message size (16 MB) to prevent memory exhaustion.
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
@@ -29,15 +39,6 @@ pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 // ============================================================================
 // Client to Server Messages
 // ============================================================================
-
-/// Client capabilities for protocol negotiation.
-/// Allows clients to opt-in to new features while maintaining backward compatibility.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct ClientCapabilities {
-    /// Client supports PaneUpdate/LayoutChanged messages (v2 protocol).
-    /// When true, server sends pane-local content instead of composited screen.
-    pub supports_pane_updates: bool,
-}
 
 /// Messages sent from client to server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,10 +53,6 @@ pub enum ClientMessage {
         term_rows: u16,
         /// Terminal type ($TERM environment variable).
         term_type: String,
-        /// Client capabilities for feature negotiation.
-        /// Optional for backward compatibility with v1 clients.
-        #[serde(default)]
-        capabilities: Option<ClientCapabilities>,
     },
 
     /// Attach to a session.
@@ -96,6 +93,13 @@ pub enum ClientMessage {
     RenameSession {
         /// New name for the session.
         new_name: String,
+    },
+
+    /// Scroll the focused pane through its scrollback.
+    Scroll {
+        /// Lines to move: positive goes back in history, negative comes forward.
+        /// Zero returns to the live view.
+        lines: i32,
     },
 
     /// Heartbeat to check connection health.
@@ -160,34 +164,12 @@ pub enum ServerMessage {
         session_id: u32,
         /// Session name.
         session_name: String,
-        /// Whether client needs a full screen redraw.
-        needs_full_redraw: bool,
     },
 
     /// Detached from session.
     Detached {
         /// Reason for detachment.
         reason: DetachReason,
-    },
-
-    /// Full screen content (sent on attach or resync).
-    FullScreen {
-        /// All rows of the screen.
-        rows: Vec<RenderedRow>,
-        /// Current cursor state.
-        cursor: CursorState,
-        /// Status line content.
-        status_line: String,
-    },
-
-    /// Incremental screen update (only changed rows).
-    Update {
-        /// Changed rows with their indices.
-        changed_rows: Vec<(u16, RenderedRow)>,
-        /// Current cursor state.
-        cursor: CursorState,
-        /// Status line (only if changed).
-        status_line: Option<String>,
     },
 
     /// List of all sessions.
@@ -211,17 +193,13 @@ pub enum ServerMessage {
         enabled: bool,
     },
 
-    // ========================================================================
-    // V2 Protocol Messages (hybrid client-server rendering)
-    // ========================================================================
     /// Layout changed (panes split/closed/resized).
-    /// Sent to clients that support pane updates.
     LayoutChanged {
         /// Complete layout of the current window.
         layout: WindowLayout,
     },
 
-    /// Pane-local content update (v2 protocol).
+    /// Pane-local content update.
     /// Contains pane-local coordinates, client composites into screen buffer.
     PaneUpdate {
         /// ID of the pane that was updated.
@@ -246,28 +224,6 @@ pub enum DetachReason {
     Replaced,
 }
 
-/// A single rendered row of terminal output.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RenderedRow {
-    /// Pre-rendered ANSI escape sequence string for this row.
-    /// Includes colors and attributes, ready to write to terminal.
-    pub content: String,
-}
-
-impl RenderedRow {
-    /// Create a new rendered row.
-    pub fn new(content: String) -> Self {
-        Self { content }
-    }
-
-    /// Create an empty rendered row.
-    pub fn empty() -> Self {
-        Self {
-            content: String::new(),
-        }
-    }
-}
-
 /// Cursor state for rendering.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CursorState {
@@ -277,8 +233,6 @@ pub struct CursorState {
     pub col: u16,
     /// Whether the cursor is visible.
     pub visible: bool,
-    /// Cursor shape.
-    pub shape: CursorShape,
 }
 
 impl Default for CursorState {
@@ -287,18 +241,8 @@ impl Default for CursorState {
             row: 0,
             col: 0,
             visible: true,
-            shape: CursorShape::Block,
         }
     }
-}
-
-/// Cursor shape variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum CursorShape {
-    #[default]
-    Block,
-    Underline,
-    Bar,
 }
 
 /// Information about a session for listing.
@@ -317,7 +261,7 @@ pub struct SessionInfo {
 }
 
 // ============================================================================
-// V2 Protocol Types (hybrid client-server rendering)
+// Pane Rendering Types (hybrid client-server rendering)
 // ============================================================================
 
 /// Layout information for a single pane.
@@ -358,12 +302,75 @@ pub struct PaneRow {
     pub row_idx: u16,
     /// Styled cells for this row.
     pub cells: Vec<Cell>,
+    /// Hyperlink runs covering cells in this row, in column order.
+    ///
+    /// Resolved server-side (explicit OSC 8 plus detected URLs) because only the
+    /// server knows where a pane's logical lines end. Carried per row rather than
+    /// as an id table so a client never has to hold state that can go stale.
+    pub links: Vec<RowLink>,
+    /// Whether this row's content continues onto the next row (soft wrap).
+    ///
+    /// The client needs this to extract selected text: a wrapped row must be
+    /// joined to the next one, or copying a long path or URL inserts a newline
+    /// in the middle of it. Only the server knows where a logical line ends.
+    pub wrapped: bool,
 }
 
 impl PaneRow {
-    /// Create a new pane row.
+    /// Create a new pane row with no hyperlinks.
     pub fn new(row_idx: u16, cells: Vec<Cell>) -> Self {
-        Self { row_idx, cells }
+        Self {
+            row_idx,
+            cells,
+            links: Vec::new(),
+            wrapped: false,
+        }
+    }
+
+    /// Create a new pane row with hyperlink runs.
+    pub fn with_links(row_idx: u16, cells: Vec<Cell>, links: Vec<RowLink>) -> Self {
+        Self {
+            row_idx,
+            cells,
+            links,
+            wrapped: false,
+        }
+    }
+
+    /// Mark whether this row soft-wraps onto the next one.
+    pub fn wrapped(mut self, wrapped: bool) -> Self {
+        self.wrapped = wrapped;
+        self
+    }
+}
+
+/// A hyperlink run within a single row of a pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowLink {
+    /// First column of the run (pane-local).
+    pub start_col: u16,
+    /// One past the last column of the run (pane-local).
+    pub end_col: u16,
+    /// OSC 8 id shared by every run of the same logical link, so the outer
+    /// terminal treats fragments split across rows as one link.
+    pub id: u32,
+    /// Target URL.
+    pub url: String,
+    /// Whether clux found this link itself rather than the application asking
+    /// for it. Detected links get an underline so they read as links; an
+    /// application's own OSC 8 links keep exactly the styling it printed.
+    pub detected: bool,
+}
+
+impl From<crate::urls::LinkRun> for RowLink {
+    fn from(run: crate::urls::LinkRun) -> Self {
+        Self {
+            start_col: run.start_col,
+            end_col: run.end_col,
+            id: run.id,
+            url: run.url,
+            detected: run.detected,
+        }
     }
 }
 
@@ -614,26 +621,6 @@ mod tests {
             term_cols: 80,
             term_rows: 24,
             term_type: "xterm-256color".to_string(),
-            capabilities: Some(ClientCapabilities {
-                supports_pane_updates: true,
-            }),
-        };
-
-        let serialized = bincode::serialize(&msg).unwrap();
-        let deserialized: ClientMessage = bincode::deserialize(&serialized).unwrap();
-
-        assert_eq!(msg, deserialized);
-    }
-
-    #[test]
-    fn test_client_message_hello_without_capabilities() {
-        // Test backward compatibility - capabilities can be None
-        let msg = ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-            term_cols: 80,
-            term_rows: 24,
-            term_type: "xterm-256color".to_string(),
-            capabilities: None,
         };
 
         let serialized = bincode::serialize(&msg).unwrap();
@@ -719,47 +706,6 @@ mod tests {
         let msg = ServerMessage::Attached {
             session_id: 1,
             session_name: "default".to_string(),
-            needs_full_redraw: true,
-        };
-
-        let serialized = bincode::serialize(&msg).unwrap();
-        let deserialized: ServerMessage = bincode::deserialize(&serialized).unwrap();
-
-        assert_eq!(msg, deserialized);
-    }
-
-    #[test]
-    fn test_server_message_full_screen_roundtrip() {
-        let msg = ServerMessage::FullScreen {
-            rows: vec![
-                RenderedRow::new("Line 1 with \x1b[31mred\x1b[0m text".to_string()),
-                RenderedRow::new("Line 2 with \x1b[1mbold\x1b[0m text".to_string()),
-                RenderedRow::empty(),
-            ],
-            cursor: CursorState {
-                row: 2,
-                col: 5,
-                visible: true,
-                shape: CursorShape::Block,
-            },
-            status_line: "[1:shell] [2:vim*]".to_string(),
-        };
-
-        let serialized = bincode::serialize(&msg).unwrap();
-        let deserialized: ServerMessage = bincode::deserialize(&serialized).unwrap();
-
-        assert_eq!(msg, deserialized);
-    }
-
-    #[test]
-    fn test_server_message_update_roundtrip() {
-        let msg = ServerMessage::Update {
-            changed_rows: vec![
-                (0, RenderedRow::new("Updated line 0".to_string())),
-                (5, RenderedRow::new("Updated line 5".to_string())),
-            ],
-            cursor: CursorState::default(),
-            status_line: Some("New status".to_string()),
         };
 
         let serialized = bincode::serialize(&msg).unwrap();
@@ -825,7 +771,6 @@ mod tests {
             term_cols: 120,
             term_rows: 40,
             term_type: "screen-256color".to_string(),
-            capabilities: None,
         };
 
         write_message(&mut buffer, &msg).unwrap();
@@ -1073,30 +1018,55 @@ mod tests {
             input_size
         );
 
-        // A typical 80x24 full screen update
-        let full_screen = ServerMessage::FullScreen {
-            rows: (0..24).map(|_| RenderedRow::new("x".repeat(80))).collect(),
-            cursor: CursorState::default(),
-            status_line: "status".to_string(),
+        // A full 80x24 pane repaint
+        let full_pane = ServerMessage::PaneUpdate {
+            pane_id: 0,
+            changed_rows: (0..24)
+                .map(|row| PaneRow::new(row, vec![Cell::new('x'); 80]))
+                .collect(),
+            cursor: Some(CursorState::default()),
         };
-        let full_screen_size = bincode::serialize(&full_screen).unwrap().len();
-        // 24 rows * ~80 chars + overhead should be < 4KB
+        let full_pane_size = bincode::serialize(&full_pane).unwrap().len();
         assert!(
-            full_screen_size < 4096,
-            "Full screen should be < 4KB, got {} bytes",
-            full_screen_size
+            full_pane_size < 64 * 1024,
+            "Full pane repaint should be < 64KB, got {} bytes",
+            full_pane_size
         );
 
         // Single row update should be much smaller
-        let update = ServerMessage::Update {
-            changed_rows: vec![(5, RenderedRow::new("x".repeat(80)))],
-            cursor: CursorState::default(),
-            status_line: None,
+        let update = ServerMessage::PaneUpdate {
+            pane_id: 0,
+            changed_rows: vec![PaneRow::new(5, vec![Cell::new('x'); 80])],
+            cursor: Some(CursorState::default()),
         };
         let update_size = bincode::serialize(&update).unwrap().len();
         assert!(
-            update_size < 200,
-            "Single row update should be < 200 bytes, got {} bytes",
+            update_size < 4096,
+            "Single row update should be < 4KB, got {} bytes",
+            update_size
+        );
+
+        // Hyperlinks add one run per row, not a URL per cell.
+        let linked = ServerMessage::PaneUpdate {
+            pane_id: 0,
+            changed_rows: vec![PaneRow::with_links(
+                5,
+                vec![Cell::new('x'); 80],
+                vec![RowLink {
+                    start_col: 0,
+                    end_col: 40,
+                    id: 7,
+                    url: "https://example.com/some/path".to_string(),
+                    detected: true,
+                }],
+            )],
+            cursor: None,
+        };
+        let linked_size = bincode::serialize(&linked).unwrap().len();
+        assert!(
+            linked_size < update_size + 128,
+            "A link should cost ~its URL, got {} bytes over {}",
+            linked_size - update_size,
             update_size
         );
     }
@@ -1119,11 +1089,14 @@ mod tests {
     }
 
     #[test]
-    fn test_unicode_in_rendered_row() {
-        let msg = ServerMessage::FullScreen {
-            rows: vec![RenderedRow::new("Hello 世界 🦀 émojis".to_string())],
-            cursor: CursorState::default(),
-            status_line: "状态栏".to_string(),
+    fn test_unicode_in_pane_row() {
+        let msg = ServerMessage::PaneUpdate {
+            pane_id: 0,
+            changed_rows: vec![PaneRow::new(
+                0,
+                "Hello 世界 🦀 émojis".chars().map(Cell::new).collect(),
+            )],
+            cursor: None,
         };
 
         let serialized = bincode::serialize(&msg).unwrap();
@@ -1144,31 +1117,8 @@ mod tests {
         assert_eq!(msg, deserialized);
     }
 
-    #[test]
-    fn test_cursor_shapes() {
-        let shapes = vec![CursorShape::Block, CursorShape::Underline, CursorShape::Bar];
-
-        for shape in shapes {
-            let msg = ServerMessage::FullScreen {
-                rows: vec![],
-                cursor: CursorState {
-                    row: 0,
-                    col: 0,
-                    visible: true,
-                    shape,
-                },
-                status_line: String::new(),
-            };
-
-            let serialized = bincode::serialize(&msg).unwrap();
-            let deserialized: ServerMessage = bincode::deserialize(&serialized).unwrap();
-
-            assert_eq!(msg, deserialized);
-        }
-    }
-
     // ------------------------------------------------------------------------
-    // V2 Protocol Tests (hybrid client-server rendering)
+    // Pane Rendering Tests (hybrid client-server rendering)
     // ------------------------------------------------------------------------
 
     #[test]
@@ -1310,7 +1260,6 @@ mod tests {
                 row: 1,
                 col: 5,
                 visible: true,
-                shape: CursorShape::Bar,
             }),
         };
 
@@ -1335,19 +1284,40 @@ mod tests {
     }
 
     #[test]
-    fn test_client_capabilities_roundtrip() {
-        let caps = ClientCapabilities {
-            supports_pane_updates: true,
+    fn test_pane_row_links_roundtrip() {
+        let msg = ServerMessage::PaneUpdate {
+            pane_id: 3,
+            changed_rows: vec![PaneRow::with_links(
+                2,
+                "https://example.com/x".chars().map(Cell::new).collect(),
+                vec![
+                    RowLink {
+                        start_col: 0,
+                        end_col: 21,
+                        id: 4242,
+                        url: "https://example.com/x".to_string(),
+                        detected: true,
+                    },
+                    RowLink {
+                        start_col: 30,
+                        end_col: 37,
+                        id: 99,
+                        url: "https://example.com/osc8".to_string(),
+                        detected: false,
+                    },
+                ],
+            )],
+            cursor: None,
         };
 
-        let serialized = bincode::serialize(&caps).unwrap();
-        let deserialized: ClientCapabilities = bincode::deserialize(&serialized).unwrap();
+        let serialized = bincode::serialize(&msg).unwrap();
+        let deserialized: ServerMessage = bincode::deserialize(&serialized).unwrap();
 
-        assert_eq!(caps, deserialized);
+        assert_eq!(msg, deserialized);
     }
 
     #[test]
-    fn test_v2_message_sizes() {
+    fn test_pane_update_message_sizes() {
         use crate::cell::Cell;
 
         // A typical pane update should be reasonably sized

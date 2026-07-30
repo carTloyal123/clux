@@ -220,14 +220,6 @@ impl SessionManager {
             .and_then(|id| self.sessions.get(id))
     }
 
-    /// Get a mutable session by name.
-    pub fn get_by_name_mut(&mut self, name: &str) -> Option<&mut Session> {
-        self.name_to_id
-            .get(name)
-            .copied()
-            .and_then(|id| self.sessions.get_mut(&id))
-    }
-
     /// Get the session ID for a name.
     pub fn id_for_name(&self, name: &str) -> Option<SessionId> {
         self.name_to_id.get(name).copied()

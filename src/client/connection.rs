@@ -255,8 +255,6 @@ fn msg_type(msg: &ServerMessage) -> &'static str {
         ServerMessage::HelloAck { .. } => "HelloAck",
         ServerMessage::Attached { .. } => "Attached",
         ServerMessage::Detached { .. } => "Detached",
-        ServerMessage::FullScreen { .. } => "FullScreen",
-        ServerMessage::Update { .. } => "Update",
         ServerMessage::SessionList(_) => "SessionList",
         ServerMessage::Error { .. } => "Error",
         ServerMessage::Pong => "Pong",
@@ -318,7 +316,6 @@ mod tests {
             term_cols: 80,
             term_rows: 24,
             term_type: "xterm".to_string(),
-            capabilities: None,
         };
         conn.send(&hello).unwrap();
 

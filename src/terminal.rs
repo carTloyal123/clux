@@ -3,10 +3,19 @@
 //! Implements the VTE Perform trait to handle ANSI escape sequences.
 //! Manages cursor position, colors, and grid updates.
 
+use std::collections::HashMap;
+
+use crate::buffer::{Buffer, ViewRow};
 use crate::cell::{Cell, CellFlags, Color, HyperlinkId};
-use crate::grid::Grid;
 use crate::hyperlink::HyperlinkStore;
-use crate::scrollback::Scrollback;
+use crate::urls::LinkRun;
+
+/// Memory a pane may spend on history.
+///
+/// 16 MB is about 8,700 rows at 80 columns with today's 24-byte cell - close to the
+/// 10,000 rows this used to keep, but as a ceiling that holds when the window is
+/// made wider.
+pub const DEFAULT_SCROLLBACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Cursor position and state.
 #[derive(Clone, Copy, Debug)]
@@ -49,14 +58,10 @@ impl Cursor {
 
 /// Terminal state machine implementing VTE's Perform trait.
 pub struct Terminal {
-    /// The terminal grid.
-    pub grid: Grid,
+    /// Content: history plus the active screen.
+    buffer: Buffer,
     /// Current cursor position.
     pub cursor: Cursor,
-    /// Scrollback buffer for history.
-    pub scrollback: Scrollback,
-    /// Current scroll offset for viewing history (0 = at bottom).
-    pub scroll_offset: usize,
     /// Hyperlink store for URL interning.
     pub hyperlinks: HyperlinkStore,
     /// Current foreground color.
@@ -77,8 +82,8 @@ pub struct Terminal {
     auto_wrap: bool,
     /// Pending wrap - cursor at end of line, waiting for next char.
     pending_wrap: bool,
-    /// Alternate screen buffer.
-    alt_grid: Option<Grid>,
+    /// Saved primary content while the alternate screen is active.
+    alt_primary: Option<Buffer>,
     /// Whether we're on the alternate screen.
     alt_screen: bool,
     /// Tab stops.
@@ -92,11 +97,11 @@ pub struct Terminal {
 impl Terminal {
     /// Create a new terminal with the given dimensions.
     pub fn new(rows: usize, cols: usize) -> Self {
-        Self::with_scrollback(rows, cols, 10_000)
+        Self::with_scrollback(rows, cols, DEFAULT_SCROLLBACK_BYTES)
     }
 
-    /// Create a new terminal with custom scrollback size.
-    pub fn with_scrollback(rows: usize, cols: usize, scrollback_lines: usize) -> Self {
+    /// Create a new terminal with a custom history budget, in bytes.
+    pub fn with_scrollback(rows: usize, cols: usize, scrollback_bytes: usize) -> Self {
         let mut tabs = vec![false; cols];
         // Default tab stops every 8 columns
         for i in (0..cols).step_by(8) {
@@ -104,10 +109,8 @@ impl Terminal {
         }
 
         Self {
-            grid: Grid::new(rows, cols),
+            buffer: Buffer::new(rows, cols, scrollback_bytes),
             cursor: Cursor::default(),
-            scrollback: Scrollback::new(scrollback_lines),
-            scroll_offset: 0,
             hyperlinks: HyperlinkStore::new(),
             fg: Color::default(),
             bg: Color::default(),
@@ -118,7 +121,7 @@ impl Terminal {
             origin_mode: false,
             auto_wrap: true,
             pending_wrap: false,
-            alt_grid: None,
+            alt_primary: None,
             alt_screen: false,
             tabs,
             mouse_mode: 0,
@@ -128,12 +131,17 @@ impl Terminal {
 
     /// Get the number of rows.
     pub fn rows(&self) -> usize {
-        self.grid.rows()
+        self.buffer.screen_rows()
     }
 
     /// Get the number of columns.
     pub fn cols(&self) -> usize {
-        self.grid.cols()
+        self.buffer.cols()
+    }
+
+    /// Rows of history above the screen.
+    pub fn history_rows(&self) -> usize {
+        self.buffer.history_rows()
     }
 
     /// Check if this terminal wants mouse events.
@@ -158,180 +166,53 @@ impl Terminal {
 
     /// Take dirty row indices and clear the dirty flags.
     pub fn take_dirty_rows(&mut self) -> Vec<u16> {
-        let dirty: Vec<u16> = self.grid.dirty_row_indices().map(|i| i as u16).collect();
-        self.grid.clear_all_dirty();
-        dirty
+        self.buffer.take_dirty_rows()
     }
 
-    /// Render a row to a string (ANSI escape sequences for styling).
-    pub fn render_row(&self, row_idx: u16) -> String {
-        use crate::cell::ColorKind;
-
-        let row = match self.grid.row(row_idx as usize) {
-            Some(r) => r,
-            None => {
-                log::warn!(
-                    "render_row: row {} out of bounds (grid has {} rows)",
-                    row_idx,
-                    self.grid.rows()
-                );
-                return String::new();
-            }
-        };
-
-        let cell_count = row.iter().count();
-
-        let mut output = String::new();
-        let mut last_fg = Color::default();
-        let mut last_bg = Color::default();
-        let mut last_flags = CellFlags::empty();
-
-        for cell in row.iter() {
-            // Check if style changed
-            if cell.fg != last_fg || cell.bg != last_bg || cell.flags != last_flags {
-                // Reset and apply new style
-                output.push_str("\x1b[0m");
-
-                // Apply foreground color
-                match cell.fg.kind {
-                    ColorKind::Default => {}
-                    ColorKind::Indexed => {
-                        let n = cell.fg.r;
-                        if n < 8 {
-                            output.push_str(&format!("\x1b[{}m", 30 + n));
-                        } else if n < 16 {
-                            output.push_str(&format!("\x1b[{}m", 90 + n - 8));
-                        } else {
-                            output.push_str(&format!("\x1b[38;5;{}m", n));
-                        }
-                    }
-                    ColorKind::Rgb => {
-                        output.push_str(&format!(
-                            "\x1b[38;2;{};{};{}m",
-                            cell.fg.r, cell.fg.g, cell.fg.b
-                        ));
-                    }
-                }
-
-                // Apply background color
-                match cell.bg.kind {
-                    ColorKind::Default => {}
-                    ColorKind::Indexed => {
-                        let n = cell.bg.r;
-                        if n < 8 {
-                            output.push_str(&format!("\x1b[{}m", 40 + n));
-                        } else if n < 16 {
-                            output.push_str(&format!("\x1b[{}m", 100 + n - 8));
-                        } else {
-                            output.push_str(&format!("\x1b[48;5;{}m", n));
-                        }
-                    }
-                    ColorKind::Rgb => {
-                        output.push_str(&format!(
-                            "\x1b[48;2;{};{};{}m",
-                            cell.bg.r, cell.bg.g, cell.bg.b
-                        ));
-                    }
-                }
-
-                // Apply flags
-                if cell.flags.contains(CellFlags::BOLD) {
-                    output.push_str("\x1b[1m");
-                }
-                if cell.flags.contains(CellFlags::ITALIC) {
-                    output.push_str("\x1b[3m");
-                }
-                if cell.flags.contains(CellFlags::UNDERLINE) {
-                    output.push_str("\x1b[4m");
-                }
-                if cell.flags.contains(CellFlags::INVERSE) {
-                    output.push_str("\x1b[7m");
-                }
-                if cell.flags.contains(CellFlags::DIM) {
-                    output.push_str("\x1b[2m");
-                }
-
-                last_fg = cell.fg;
-                last_bg = cell.bg;
-                last_flags = cell.flags;
-            }
-
-            output.push(cell.c);
-        }
-
-        // Reset at end of line
-        output.push_str("\x1b[0m");
-
-        log::trace!(
-            "render_row {}: {} cells -> {} chars output",
-            row_idx,
-            cell_count,
-            output.len()
-        );
-
-        output
+    /// The row the user sees at this screen position.
+    ///
+    /// Comes from the scrollback when the view is scrolled back, otherwise from
+    /// the live grid - see [`crate::scrollview`]. Everything that serializes a
+    /// pane row goes through here so the two cannot drift apart.
+    pub fn view_row(&self, row_idx: u16) -> ViewRow {
+        self.buffer.view_row(row_idx)
     }
 
-    /// Render a row as plain text (no ANSI escape sequences).
-    /// Used for compositing multiple panes into a single screen buffer.
-    pub fn render_row_plain(&self, row_idx: u16) -> String {
-        let row = match self.grid.row(row_idx as usize) {
-            Some(r) => r,
-            None => return String::new(),
-        };
-
-        row.iter().map(|cell| cell.c).collect()
-    }
-
-    /// Get cells for a row (for styled compositing).
-    pub fn get_row_cells(&self, row_idx: u16) -> Vec<Cell> {
-        let row = match self.grid.row(row_idx as usize) {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-
-        row.iter().cloned().collect()
+    /// Resolve the hyperlinks covering `rows`, following soft-wrap continuations.
+    ///
+    /// Resolves against whatever the pane is showing, so links keep working while
+    /// scrolled back through history. `salt` scopes the generated OSC 8 ids to this
+    /// pane. The result can cover rows outside `rows` when a link wraps onto them;
+    /// those rows need repainting too. See [`crate::urls`] for why the
+    /// multiplexer, not the outer terminal, has to do this.
+    pub fn resolve_links(
+        &self,
+        salt: u32,
+        detect_plain_urls: bool,
+        rows: &[u16],
+    ) -> HashMap<u16, Vec<LinkRun>> {
+        crate::urls::resolve_links(
+            &self.buffer,
+            &self.hyperlinks,
+            salt,
+            detect_plain_urls,
+            rows,
+        )
     }
 
     /// Resize the terminal.
+    ///
+    /// The buffer re-wraps its content, history included, and reports where the
+    /// cursor's character ended up.
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        let old_rows = self.grid.rows();
-        let old_scroll_offset = self.scroll_offset;
+        let (cursor_row, cursor_col) =
+            self.buffer
+                .resize(rows, cols, (self.cursor.row, self.cursor.col));
+        self.cursor.row = cursor_row.min(rows.saturating_sub(1));
+        self.cursor.col = cursor_col.min(cols.saturating_sub(1));
 
-        // For main screen (not alt screen), use reflow-aware resize
-        if !self.alt_screen {
-            // When shrinking height and cursor would be out of bounds,
-            // first push overflow content to scrollback
-            if rows < old_rows && self.cursor.row >= rows {
-                let scroll_amount = self.cursor.row - rows + 1;
-
-                for _ in 0..scroll_amount {
-                    if let Some(row) = self.grid.row(0) {
-                        let cells: Vec<Cell> = (0..self.grid.cols())
-                            .filter_map(|c| row.get(c).copied())
-                            .collect();
-                        let wrapped = row.is_wrapped();
-                        self.scrollback.push(cells, wrapped);
-                    }
-                    self.grid.scroll_up();
-                }
-
-                self.cursor.row = self.cursor.row.saturating_sub(scroll_amount);
-            }
-
-            // Use reflow-aware resize for width changes
-            let (new_cursor_row, new_cursor_col) =
-                self.grid
-                    .resize_with_reflow(rows, cols, self.cursor.row, self.cursor.col);
-            self.cursor.row = new_cursor_row;
-            self.cursor.col = new_cursor_col;
-        } else {
-            // Alt screen: simple resize without reflow
-            self.grid.resize(rows, cols);
-        }
-
-        if let Some(ref mut alt) = self.alt_grid {
-            alt.resize(rows, cols);
+        if let Some(alt) = self.alt_primary.as_mut() {
+            alt.resize(rows, cols, (0, 0));
         }
 
         // Update scroll region
@@ -345,14 +226,6 @@ impl Terminal {
         for i in (0..cols).step_by(8) {
             self.tabs[i] = true;
         }
-
-        // Ensure cursor is within bounds
-        self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
-        self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
-
-        // Preserve scroll offset (clamp to valid range if needed)
-        let max_offset = self.scrollback.len();
-        self.scroll_offset = old_scroll_offset.min(max_offset);
     }
 
     /// Create the current cell template with colors and flags.
@@ -371,16 +244,14 @@ impl Terminal {
         // Handle pending wrap
         if self.pending_wrap {
             self.pending_wrap = false;
-            if let Some(row) = self.grid.row_mut(self.cursor.row) {
-                row.set_wrapped(true);
-            }
+            self.buffer.set_row_wrapped(self.cursor.row, true);
             self.cursor.col = 0;
             self.linefeed();
         }
 
         // Write the character
         let cell = self.cell_template(c);
-        self.grid.set(self.cursor.row, self.cursor.col, cell);
+        self.buffer.set_cell(self.cursor.row, self.cursor.col, cell);
 
         // Advance cursor
         if self.cursor.col + 1 >= self.cols() {
@@ -394,61 +265,40 @@ impl Terminal {
 
     /// Perform a linefeed (move cursor down, scroll if needed).
     pub fn linefeed(&mut self) {
-        if self.cursor.row + 1 >= self.scroll_bottom {
-            // At bottom of scroll region - scroll up
-            // Save the line being scrolled out to scrollback (only for main screen)
-            if !self.alt_screen && self.scroll_top == 0 {
-                if let Some(row) = self.grid.row(0) {
-                    let cells: Vec<Cell> = (0..self.cols())
-                        .filter_map(|c| row.get(c).copied())
-                        .collect();
-                    let wrapped = row.is_wrapped();
-                    self.scrollback.push(cells, wrapped);
-                }
-            }
-            self.grid
-                .scroll_region_up(self.scroll_top, self.scroll_bottom);
-        } else {
+        if self.cursor.row + 1 < self.scroll_bottom {
             self.cursor.row += 1;
+            return;
+        }
+
+        if self.scroll_top == 0 && self.scroll_bottom == self.rows() {
+            // A full-screen scroll: the top row becomes history where it sits.
+            // A pinned view keeps showing the same rows on its own, because it
+            // holds an absolute position rather than an offset.
+            self.buffer.scroll_up();
+        } else {
+            // A scroll region is a window inside the screen; nothing leaves it.
+            self.buffer
+                .scroll_region_up(self.scroll_top, self.scroll_bottom);
         }
     }
 
-    /// Scroll the view for scrollback navigation.
-    /// Positive delta scrolls up (into history), negative scrolls down.
-    pub fn scroll_view(&mut self, delta: i32) {
-        // delta < 0 means scroll up (view older content, increase offset)
-        // delta > 0 means scroll down (view newer content, decrease offset)
-        let max_offset = self.scrollback.len();
-        let new_offset = (self.scroll_offset as i32 - delta)
-            .max(0)
-            .min(max_offset as i32) as usize;
+    /// Scroll the view through the scrollback.
+    ///
+    /// `lines` is positive to go back in history and negative to come forward;
+    /// the result is clamped to the recorded scrollback. Returns whether the view
+    /// moved.
+    pub fn scroll_view(&mut self, lines: i32) -> bool {
+        self.buffer.scroll_view(lines)
+    }
 
-        if new_offset != self.scroll_offset {
-            self.scroll_offset = new_offset;
-            // Mark all rows dirty for re-render
-            for i in 0..self.rows() {
-                if let Some(row) = self.grid.row_mut(i) {
-                    row.mark_dirty();
-                }
-            }
-        }
+    /// Jump back to the live view. Returns whether the view moved.
+    pub fn reset_scroll(&mut self) -> bool {
+        self.buffer.reset_scroll()
     }
 
     /// Check if we're viewing scrollback (not at bottom).
     pub fn is_scrolled(&self) -> bool {
-        self.scroll_offset > 0
-    }
-
-    /// Scroll to the bottom (exit scrollback view).
-    pub fn scroll_to_bottom(&mut self) {
-        if self.scroll_offset > 0 {
-            self.scroll_offset = 0;
-            for i in 0..self.rows() {
-                if let Some(row) = self.grid.row_mut(i) {
-                    row.mark_dirty();
-                }
-            }
-        }
+        self.buffer.is_scrolled()
     }
 
     /// Move cursor to the next tab stop.
@@ -560,8 +410,8 @@ impl Terminal {
         if !self.alt_screen {
             let rows = self.rows();
             let cols = self.cols();
-            let main_grid = std::mem::replace(&mut self.grid, Grid::new(rows, cols));
-            self.alt_grid = Some(main_grid);
+            let alt = Buffer::new(rows, cols, 0);
+            self.alt_primary = Some(std::mem::replace(&mut self.buffer, alt));
             self.alt_screen = true;
         }
     }
@@ -569,8 +419,9 @@ impl Terminal {
     /// Switch back to main screen buffer.
     fn exit_alt_screen(&mut self) {
         if self.alt_screen {
-            if let Some(main_grid) = self.alt_grid.take() {
-                self.grid = main_grid;
+            if let Some(primary) = self.alt_primary.take() {
+                self.buffer = primary;
+                self.buffer.mark_all_dirty();
             }
             self.alt_screen = false;
         }
@@ -639,22 +490,26 @@ impl vte::Perform for Terminal {
             // OSC 8 - hyperlinks
             Some(8) => {
                 // OSC 8 format: ESC ] 8 ; params ; URI ST
-                // params[0] = "8", params[1] = id/params, params[2] = URI
+                // params[0] = "8", params[1] = id/params, params[2..] = URI
+                //
+                // The parser splits on ';', but ';' is legal inside a URI
+                // (matrix parameters, mailto headers), so rejoin the tail
+                // instead of truncating the URL at the first one.
                 if params.len() >= 2 {
                     let uri = if params.len() >= 3 {
-                        std::str::from_utf8(params[2]).ok()
+                        join_semicolons(&params[2..])
                     } else {
                         // Empty URI closes hyperlink
-                        std::str::from_utf8(params[1]).ok()
+                        std::str::from_utf8(params[1]).ok().map(str::to_string)
                     };
 
-                    match uri {
-                        Some(url) if !url.is_empty() => {
+                    match uri.as_deref().and_then(crate::urls::sanitize_url) {
+                        Some(url) => {
                             // Open hyperlink - intern the URL
-                            let id = self.hyperlinks.intern(url);
+                            let id = self.hyperlinks.intern(&url);
                             self.hyperlink = Some(id);
                         }
-                        _ => {
+                        None => {
                             // Close hyperlink
                             self.hyperlink = None;
                         }
@@ -737,15 +592,15 @@ impl vte::Perform for Terminal {
                 match mode {
                     0 => {
                         // Clear from cursor to end of screen
-                        self.grid.clear_below(self.cursor.row, self.cursor.col);
+                        self.buffer.clear_below(self.cursor.row, self.cursor.col);
                     }
                     1 => {
                         // Clear from start of screen to cursor
-                        self.grid.clear_above(self.cursor.row, self.cursor.col);
+                        self.buffer.clear_above(self.cursor.row, self.cursor.col);
                     }
                     2 | 3 => {
                         // Clear entire screen (3 also clears scrollback, but we don't have that yet)
-                        self.grid.clear();
+                        self.buffer.clear_screen();
                     }
                     _ => {}
                 }
@@ -753,20 +608,24 @@ impl vte::Perform for Terminal {
             // EL - Erase in Line
             ('K', false) => {
                 let mode = params.first().copied().unwrap_or(0);
-                if let Some(row) = self.grid.row_mut(self.cursor.row) {
-                    match mode {
-                        0 => row.clear_from(self.cursor.col),
-                        1 => row.clear_to(self.cursor.col + 1),
-                        2 => row.clear(),
-                        _ => {}
-                    }
+                let row = self.cursor.row;
+                let cols = self.cols();
+                match mode {
+                    0 => self
+                        .buffer
+                        .clear_active_row_range(row, self.cursor.col, cols),
+                    1 => self
+                        .buffer
+                        .clear_active_row_range(row, 0, self.cursor.col + 1),
+                    2 => self.buffer.clear_active_row(row),
+                    _ => {}
                 }
             }
             // IL - Insert Lines
             ('L', false) => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
-                    self.grid
+                    self.buffer
                         .scroll_region_down(self.cursor.row, self.scroll_bottom);
                 }
             }
@@ -774,7 +633,7 @@ impl vte::Perform for Terminal {
             ('M', false) => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
-                    self.grid
+                    self.buffer
                         .scroll_region_up(self.cursor.row, self.scroll_bottom);
                 }
             }
@@ -787,7 +646,7 @@ impl vte::Perform for Terminal {
             ('S', false) => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
-                    self.grid
+                    self.buffer
                         .scroll_region_up(self.scroll_top, self.scroll_bottom);
                 }
             }
@@ -795,7 +654,7 @@ impl vte::Perform for Terminal {
             ('T', false) => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
-                    self.grid
+                    self.buffer
                         .scroll_region_down(self.scroll_top, self.scroll_bottom);
                 }
             }
@@ -938,7 +797,7 @@ impl vte::Perform for Terminal {
             // RI - Reverse Index (move up one line, scroll if needed)
             (b'M', []) => {
                 if self.cursor.row == self.scroll_top {
-                    self.grid
+                    self.buffer
                         .scroll_region_down(self.scroll_top, self.scroll_bottom);
                 } else {
                     self.cursor.row = self.cursor.row.saturating_sub(1);
@@ -947,6 +806,13 @@ impl vte::Perform for Terminal {
             _ => {}
         }
     }
+}
+
+/// Rejoin OSC parameters that the parser split on a ';' belonging to the payload.
+fn join_semicolons(params: &[&[u8]]) -> Option<String> {
+    let parts: Option<Vec<&str>> = params.iter().map(|p| std::str::from_utf8(p).ok()).collect();
+
+    Some(parts?.join(";"))
 }
 
 #[cfg(test)]
@@ -967,7 +833,7 @@ mod tests {
     fn test_put_char() {
         let mut term = Terminal::new(24, 80);
         term.put_char('A');
-        assert_eq!(term.grid.get(0, 0).unwrap().c, 'A');
+        assert_eq!(term.buffer.cell(0, 0).unwrap().c, 'A');
         assert_eq!(term.cursor.col, 1);
     }
 
@@ -991,6 +857,56 @@ mod tests {
         let seq = b"\x1b[A";
         parser.advance(&mut term, seq);
         assert_eq!(term.cursor.row, 9);
+    }
+
+    /// Feed bytes through a real VTE parser, as the server does.
+    fn feed(term: &mut Terminal, bytes: &[u8]) {
+        let mut parser = vte::Parser::new();
+        parser.advance(term, bytes);
+    }
+
+    /// URL of the hyperlink on the cell at (row, col), if any.
+    fn link_at(term: &Terminal, row: usize, col: usize) -> Option<&str> {
+        let id = term.buffer.cell(row, col)?.hyperlink?;
+        term.hyperlinks.get(id)
+    }
+
+    #[test]
+    fn test_osc8_hyperlink_marks_cells() {
+        let mut term = Terminal::new(24, 80);
+        feed(
+            &mut term,
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ plain",
+        );
+
+        assert_eq!(link_at(&term, 0, 0), Some("https://example.com"));
+        assert_eq!(link_at(&term, 0, 3), Some("https://example.com"));
+        assert_eq!(link_at(&term, 0, 4), None, "closed link leaked");
+    }
+
+    #[test]
+    fn test_osc8_keeps_semicolons_in_url() {
+        let mut term = Terminal::new(24, 80);
+        // ';' is legal in a URI; the parser splits on it, so it must be rejoined.
+        feed(
+            &mut term,
+            b"\x1b]8;;https://example.com/a;b=1;c=2\x1b\\x\x1b]8;;\x1b\\",
+        );
+
+        assert_eq!(link_at(&term, 0, 0), Some("https://example.com/a;b=1;c=2"));
+    }
+
+    #[test]
+    fn test_osc8_rejects_control_characters_in_url() {
+        let mut term = Terminal::new(24, 80);
+        // A URL is re-emitted inside OSC 8, so control bytes must never survive.
+        feed(&mut term, b"\x1b]8;;https://a.io/\x07x\x1b\\y");
+
+        let url = link_at(&term, 0, 0).expect("link");
+        assert!(
+            !url.chars().any(|c| c.is_control()),
+            "control char in {url:?}"
+        );
     }
 
     #[test]
@@ -1051,19 +967,155 @@ mod tests {
         }
 
         // Verify scrollback has content
-        assert!(term.scrollback.len() >= 5, "Scrollback should have content");
+        assert!(term.history_rows() >= 5, "Scrollback should have content");
 
-        // Scroll up into history
-        term.scroll_view(-5);
-        assert_eq!(term.scroll_offset, 5, "Should be scrolled up 5 lines");
+        // Scroll back into history (positive = older)
+        term.scroll_view(5);
+        assert_eq!(
+            term.buffer.scroll_offset(),
+            5,
+            "Should be scrolled up 5 lines"
+        );
 
         // Resize (same size to test offset preservation)
         term.resize(24, 80);
 
         // Scroll offset should be preserved
         assert_eq!(
-            term.scroll_offset, 5,
+            term.buffer.scroll_offset(),
+            5,
             "Scroll offset should be preserved after resize"
+        );
+    }
+
+    /// Fill the scrollback by pushing `count` lines out of the top of the grid.
+    fn fill_scrollback(term: &mut Terminal, count: usize) {
+        for i in 0..count {
+            term.cursor.row = term.rows() - 1;
+            term.cursor.col = 0;
+            term.linefeed();
+            for c in format!("line {}", i).chars() {
+                term.put_char(c);
+            }
+        }
+    }
+
+    #[test]
+    fn test_scroll_view_clamps_to_recorded_history() {
+        let mut term = Terminal::new(24, 80);
+        fill_scrollback(&mut term, 10);
+
+        // Cannot scroll past the oldest recorded line...
+        term.scroll_view(1000);
+        assert_eq!(term.buffer.scroll_offset(), term.history_rows());
+
+        // ...nor forward past the live view.
+        term.scroll_view(-1000);
+        assert_eq!(term.buffer.scroll_offset(), 0);
+        assert!(!term.is_scrolled());
+    }
+
+    #[test]
+    fn test_scroll_view_reports_whether_it_moved() {
+        let mut term = Terminal::new(24, 80);
+        fill_scrollback(&mut term, 4);
+
+        assert!(term.scroll_view(2), "moving back should report a change");
+        assert!(!term.scroll_view(0), "a zero move changes nothing");
+        assert!(term.reset_scroll(), "returning to live is a change");
+        assert!(!term.reset_scroll(), "already live, nothing to do");
+    }
+
+    #[test]
+    fn test_scrolled_view_stays_pinned_as_output_arrives() {
+        let mut term = Terminal::new(24, 80);
+        fill_scrollback(&mut term, 10);
+
+        term.scroll_view(5);
+        let pinned = term.view_row(0);
+
+        // More output pushes another line into the scrollback; the view must show
+        // the same content rather than drifting a line at a time.
+        fill_scrollback(&mut term, 1);
+        assert_eq!(term.buffer.scroll_offset(), 6);
+        assert_eq!(term.view_row(0), pinned);
+    }
+
+    #[test]
+    fn test_view_row_reads_history_when_scrolled() {
+        let mut term = Terminal::new(24, 80);
+        fill_scrollback(&mut term, 30);
+
+        let live_top: String = term.view_row(0).cells.iter().map(|c| c.c).collect();
+        term.scroll_view(3);
+        let scrolled_top: String = term.view_row(0).cells.iter().map(|c| c.c).collect();
+
+        assert_ne!(
+            live_top.trim(),
+            scrolled_top.trim(),
+            "scrolling should show different content"
+        );
+    }
+
+    #[test]
+    fn test_links_resolve_in_scrolled_back_history() {
+        let mut term = Terminal::new(4, 40);
+
+        // Put a URL on screen, then push it up into the scrollback.
+        feed(&mut term, b"see https://example.com/history\n");
+        fill_scrollback(&mut term, 8);
+
+        let live = term.resolve_links(1, true, &[0, 1, 2, 3]);
+        assert!(
+            live.is_empty(),
+            "the URL should have scrolled off the live view: {live:?}"
+        );
+
+        // Scroll back far enough to bring it into view.
+        let mut found = None;
+        for offset in 1..=term.history_rows() as i32 {
+            term.reset_scroll();
+            term.scroll_view(offset);
+            let rows: Vec<u16> = (0..term.rows() as u16).collect();
+            let links = term.resolve_links(1, true, &rows);
+            if let Some(run) = links.values().flatten().next() {
+                found = Some(run.url.clone());
+                break;
+            }
+        }
+
+        assert_eq!(
+            found.as_deref(),
+            Some("https://example.com/history"),
+            "a URL in the scrollback should still resolve to a link"
+        );
+    }
+
+    #[test]
+    fn test_explicit_osc8_links_resolve_in_history() {
+        let mut term = Terminal::new(4, 40);
+        feed(
+            &mut term,
+            b"\x1b]8;;https://example.com/app\x1b\\CLICKME\x1b]8;;\x1b\\\n",
+        );
+        fill_scrollback(&mut term, 8);
+
+        let mut found = None;
+        for offset in 1..=term.history_rows() as i32 {
+            term.reset_scroll();
+            term.scroll_view(offset);
+            let rows: Vec<u16> = (0..term.rows() as u16).collect();
+            let links = term.resolve_links(1, true, &rows);
+            if let Some(run) = links.values().flatten().find(|r| !r.detected) {
+                found = Some(run.url.clone());
+                break;
+            }
+        }
+
+        assert_eq!(
+            found.as_deref(),
+            Some("https://example.com/app"),
+            "an application's OSC 8 link should survive into the scrollback"
         );
     }
 
@@ -1083,7 +1135,7 @@ mod tests {
         term.cursor.col = 7; // After "Line 20"
 
         // Verify initial state
-        assert_eq!(term.scrollback.len(), 0, "No scrollback yet");
+        assert_eq!(term.history_rows(), 0, "No scrollback yet");
         assert_eq!(term.cursor.row, 20);
 
         // Now resize to only 10 rows - cursor at row 20 would be out of bounds
@@ -1098,16 +1150,16 @@ mod tests {
 
         // Content should have been pushed to scrollback
         assert!(
-            term.scrollback.len() > 0,
+            term.history_rows() > 0,
             "Scrollback should have content after shrinking with cursor below new height"
         );
 
         // The content from the top rows should now be in scrollback
         // We scrolled up (20 - 10 + 1 = 11) rows to bring cursor into view
         assert!(
-            term.scrollback.len() >= 11,
+            term.history_rows() >= 11,
             "Scrollback should have at least 11 lines, got {}",
-            term.scrollback.len()
+            term.history_rows()
         );
     }
 
@@ -1127,7 +1179,7 @@ mod tests {
         term.cursor.col = 7;
 
         // Verify initial state
-        assert_eq!(term.scrollback.len(), 0, "No scrollback yet");
+        assert_eq!(term.history_rows(), 0, "No scrollback yet");
 
         // Resize to 10 rows - cursor at row 5 is still within bounds
         term.resize(10, 80);
@@ -1137,13 +1189,16 @@ mod tests {
 
         // No scrollback needed since cursor was in bounds
         assert_eq!(
-            term.scrollback.len(),
+            term.history_rows(),
             0,
             "No scrollback needed when cursor stays in bounds"
         );
 
         // Content should still be there
-        let row0 = term.grid.row(0).unwrap();
-        assert_eq!(row0.get(0).unwrap().c, 'L', "Content at row 0 preserved");
+        assert_eq!(
+            term.buffer.cell(0, 0).map(|c| c.c),
+            Some('L'),
+            "Content at row 0 preserved"
+        );
     }
 }

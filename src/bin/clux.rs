@@ -8,7 +8,9 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
 use crossterm::{
     cursor::MoveTo,
@@ -18,13 +20,23 @@ use crossterm::{
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 
-use clux::client::{cells_to_ansi, Client, ClientConfig, ClientError, ClientTarget, ScreenBuffer};
+use clux::client::{
+    encode_mouse_sgr, Client, ClientConfig, ClientError, ClientTarget, ScreenBuffer,
+    BEGIN_SYNC_UPDATE, END_SYNC_UPDATE,
+};
+use clux::clipboard;
 use clux::config::Config;
-use clux::event::encode_mouse_sgr;
 use clux::protocol::{CommandAction, DetachReason, Direction, ServerMessage, WindowLayout};
+use clux::selection::SelectionMode;
 use clux::server::default_socket_path;
 
 const SERVER_TOKEN: Token = Token(0);
+
+/// Lines the wheel moves per notch.
+const WHEEL_LINES: i32 = 3;
+
+/// Lines `<prefix> PageUp`/`PageDown` moves.
+const PAGE_LINES: i32 = 20;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CliOptions {
@@ -432,12 +444,10 @@ fn run_attached_with_options(client: &mut Client, options: RunOptions) -> anyhow
         let timeout = Duration::from_millis(50);
         let mut loop_count = 0u64;
 
-        // V2 rendering state
         // Inner dimensions (excluding border)
         let inner_cols = term_cols.saturating_sub(2) as usize;
         let inner_rows = term_rows.saturating_sub(2) as usize;
         let mut screen_buffer = ScreenBuffer::new(inner_cols, inner_rows);
-        let mut use_v2_rendering = false;
 
         log::info!("Entering main event loop...");
 
@@ -475,12 +485,7 @@ fn run_attached_with_options(client: &mut Client, options: RunOptions) -> anyhow
                         match client.try_recv() {
                             Ok(Some(msg)) => {
                                 log::info!("Received server message: {:?}", msg_summary(&msg));
-                                match handle_server_message(
-                                    msg,
-                                    &mut stdout,
-                                    &mut screen_buffer,
-                                    use_v2_rendering,
-                                )? {
+                                match handle_server_message(msg, &mut stdout, &mut screen_buffer)? {
                                     MessageResult::Continue => {
                                         log::debug!("Message handled, continuing");
                                     }
@@ -500,11 +505,7 @@ fn run_attached_with_options(client: &mut Client, options: RunOptions) -> anyhow
                                         mouse_mode_enabled = enabled;
                                     }
                                     MessageResult::LayoutChanged(layout) => {
-                                        log::info!(
-                                            "Switching to v2 rendering, {} panes",
-                                            layout.panes.len()
-                                        );
-                                        use_v2_rendering = true;
+                                        log::info!("New layout, {} panes", layout.panes.len());
                                         screen_buffer.set_layout(layout);
                                         // Render immediately to show dividers
                                         render_screen_buffer(&mut stdout, &screen_buffer)?;
@@ -599,17 +600,99 @@ fn run_attached_with_options(client: &mut Client, options: RunOptions) -> anyhow
                                             client.send_input(bytes)?;
                                         }
                                     }
+                                    InternalAction::Scroll(lines) => {
+                                        client.send_scroll(lines)?;
+                                    }
                                     InternalAction::Command(cmd) => {
                                         client.send_command(cmd)?;
                                     }
                                 }
                             }
                         } else if let Some(bytes) = key_to_bytes(&key) {
+                            // Typing replaces the selection, as in any terminal.
+                            if screen_buffer.has_selection() {
+                                screen_buffer.clear_selection();
+                                repaint(&mut stdout, &screen_buffer)?;
+                            }
+
                             // Send key to PTY
                             client.send_input(bytes)?;
                         }
                     }
                     Event::Mouse(mouse) => {
+                        // Left-button gestures select text, unless the focused
+                        // application has grabbed the mouse - then Shift overrides
+                        // it, the same way xterm and Ghostty do. A drag already in
+                        // progress keeps selecting even if Shift is released.
+                        let left_gesture = matches!(
+                            mouse.kind,
+                            MouseEventKind::Down(MouseButton::Left)
+                                | MouseEventKind::Drag(MouseButton::Left)
+                                | MouseEventKind::Up(MouseButton::Left)
+                        );
+                        let continuing_drag = screen_buffer.has_selection()
+                            && matches!(
+                                mouse.kind,
+                                MouseEventKind::Drag(MouseButton::Left)
+                                    | MouseEventKind::Up(MouseButton::Left)
+                            );
+                        let selecting = left_gesture
+                            && (!mouse_mode_enabled
+                                || mouse.modifiers.contains(KeyModifiers::SHIFT)
+                                || continuing_drag);
+
+                        if selecting {
+                            if let Some((row, col)) = inner_position(&mouse) {
+                                match mouse.kind {
+                                    MouseEventKind::Down(_) => {
+                                        // Alt+drag selects a rectangle.
+                                        let mode = if mouse.modifiers.contains(KeyModifiers::ALT) {
+                                            SelectionMode::Block
+                                        } else {
+                                            SelectionMode::Normal
+                                        };
+                                        screen_buffer.begin_selection(row, col, mode);
+                                        repaint(&mut stdout, &screen_buffer)?;
+                                    }
+                                    MouseEventKind::Drag(_) => {
+                                        if screen_buffer.extend_selection(row, col) {
+                                            repaint(&mut stdout, &screen_buffer)?;
+                                        }
+                                    }
+                                    MouseEventKind::Up(_) => {
+                                        if config.selection.copy_on_select {
+                                            copy_selection(&mut stdout, &screen_buffer);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                // Clicked the border: drop any old selection.
+                                screen_buffer.clear_selection();
+                                repaint(&mut stdout, &screen_buffer)?;
+                            }
+                            continue;
+                        }
+
+                        // The wheel scrolls the pane's history, unless the
+                        // application asked for the mouse - then Shift overrides.
+                        let wheel = matches!(
+                            mouse.kind,
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        );
+                        if wheel
+                            && (!mouse_mode_enabled
+                                || mouse.modifiers.contains(KeyModifiers::SHIFT))
+                        {
+                            let lines = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                                WHEEL_LINES
+                            } else {
+                                -WHEEL_LINES
+                            };
+                            client.send_scroll(lines)?;
+                            continue;
+                        }
+
                         // Only forward mouse events if the focused pane has enabled mouse mode
                         if !mouse_mode_enabled {
                             continue;
@@ -657,10 +740,9 @@ fn run_attached_with_options(client: &mut Client, options: RunOptions) -> anyhow
                         let inner_rows = rows.saturating_sub(2);
                         client.send_resize(inner_cols, inner_rows)?;
 
-                        // Resize the screen buffer and reset v2 rendering state
-                        // The server will send a new LayoutChanged + PaneUpdate
+                        // Resize the screen buffer; the server will send a new
+                        // LayoutChanged + PaneUpdate for the new size.
                         screen_buffer.resize(inner_cols as usize, inner_rows as usize);
-                        use_v2_rendering = false;
 
                         // Redraw border
                         render_border(&mut stdout, cols, rows, &session_name, "")?;
@@ -749,35 +831,11 @@ fn msg_summary(msg: &ServerMessage) -> String {
         ServerMessage::Attached {
             session_id,
             session_name,
-            needs_full_redraw,
         } => {
-            format!(
-                "Attached(session={}, name={}, redraw={})",
-                session_id, session_name, needs_full_redraw
-            )
+            format!("Attached(session={}, name={})", session_id, session_name)
         }
         ServerMessage::Detached { reason } => {
             format!("Detached(reason={:?})", reason)
-        }
-        ServerMessage::FullScreen { rows, cursor, .. } => {
-            format!(
-                "FullScreen(rows={}, cursor=({},{}))",
-                rows.len(),
-                cursor.row,
-                cursor.col
-            )
-        }
-        ServerMessage::Update {
-            changed_rows,
-            cursor,
-            ..
-        } => {
-            format!(
-                "Update(changed={}, cursor=({},{}))",
-                changed_rows.len(),
-                cursor.row,
-                cursor.col
-            )
         }
         ServerMessage::SessionList(sessions) => {
             format!("SessionList(count={})", sessions.len())
@@ -807,13 +865,12 @@ fn msg_summary(msg: &ServerMessage) -> String {
 }
 
 /// Handle a message from the server.
-/// Content is rendered with offset (1, 1) to account for the border.
-/// When using v2 rendering, updates are applied to the screen_buffer.
+/// Content is rendered with offset (1, 1) to account for the border; pane
+/// updates are composited into the screen_buffer.
 fn handle_server_message(
     msg: ServerMessage,
     stdout: &mut io::Stdout,
     screen_buffer: &mut ScreenBuffer,
-    use_v2_rendering: bool,
 ) -> anyhow::Result<MessageResult> {
     log::debug!("handle_server_message: {}", msg_summary(&msg));
 
@@ -822,112 +879,6 @@ fn handle_server_message(
     const Y_OFFSET: u16 = 1;
 
     match msg {
-        ServerMessage::FullScreen {
-            rows,
-            cursor,
-            status_line: _,
-        } => {
-            // V1 protocol - only use if not in v2 mode
-            if use_v2_rendering {
-                log::debug!("Ignoring FullScreen in v2 rendering mode");
-                return Ok(MessageResult::Continue);
-            }
-
-            log::info!(
-                "Rendering full screen: {} rows, cursor at ({},{})",
-                rows.len(),
-                cursor.row,
-                cursor.col
-            );
-
-            // Get terminal size to know inner width
-            let (term_cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
-            let inner_cols = term_cols.saturating_sub(2) as usize;
-
-            // Render all rows with offset for border
-            for (i, row) in rows.iter().enumerate() {
-                // Move to position inside border
-                queue!(stdout, MoveTo(X_OFFSET, Y_OFFSET + i as u16))?;
-
-                // Write content, truncated to inner width
-                let content: String = row.content.chars().take(inner_cols).collect();
-                write!(stdout, "{}", content)?;
-
-                // Clear to end of inner area (but not the border)
-                let content_width = content.chars().count();
-                if content_width < inner_cols {
-                    let padding = " ".repeat(inner_cols - content_width);
-                    write!(stdout, "{}", padding)?;
-                }
-            }
-
-            // Position cursor with offset
-            if cursor.visible {
-                let cursor_col = X_OFFSET + cursor.col;
-                let cursor_row = Y_OFFSET + cursor.row;
-                log::debug!(
-                    "Positioning cursor at ({}, {}) (screen: {}, {})",
-                    cursor.col,
-                    cursor.row,
-                    cursor_col,
-                    cursor_row
-                );
-                crossterm::execute!(
-                    stdout,
-                    crossterm::cursor::MoveTo(cursor_col, cursor_row),
-                    crossterm::cursor::Show,
-                )?;
-            } else {
-                crossterm::execute!(stdout, crossterm::cursor::Hide)?;
-            }
-
-            log::debug!("Full screen render complete");
-            Ok(MessageResult::Continue)
-        }
-        ServerMessage::Update {
-            changed_rows,
-            cursor,
-            status_line: _,
-        } => {
-            // V1 protocol - only use if not in v2 mode
-            if use_v2_rendering {
-                log::debug!("Ignoring Update in v2 rendering mode");
-                return Ok(MessageResult::Continue);
-            }
-
-            // Get terminal size to know inner width
-            let (term_cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
-            let inner_cols = term_cols.saturating_sub(2) as usize;
-
-            // Update only changed rows with offset for border
-            for (row_idx, row) in changed_rows {
-                queue!(stdout, MoveTo(X_OFFSET, Y_OFFSET + row_idx))?;
-
-                // Write content, truncated to inner width
-                let content: String = row.content.chars().take(inner_cols).collect();
-                write!(stdout, "{}", content)?;
-
-                // Clear to end of inner area
-                let content_width = content.chars().count();
-                if content_width < inner_cols {
-                    let padding = " ".repeat(inner_cols - content_width);
-                    write!(stdout, "{}", padding)?;
-                }
-            }
-
-            // Position cursor with offset
-            if cursor.visible {
-                let cursor_col = X_OFFSET + cursor.col;
-                let cursor_row = Y_OFFSET + cursor.row;
-                crossterm::execute!(
-                    stdout,
-                    crossterm::cursor::MoveTo(cursor_col, cursor_row),
-                    crossterm::cursor::Show,
-                )?;
-            }
-
-            Ok(MessageResult::Continue)
-        }
         ServerMessage::LayoutChanged { layout } => {
             log::info!(
                 "Layout changed: {} panes, screen {}x{}",
@@ -952,6 +903,10 @@ fn handle_server_message(
             // Apply update to screen buffer
             screen_buffer.apply_pane_update(pane_id, &changed_rows);
 
+            // Present the whole update as one frame, so a repaint spanning
+            // several rows is never shown half-drawn.
+            write!(stdout, "{}", BEGIN_SYNC_UPDATE)?;
+
             // Render the changed rows from the screen buffer
             for pane_row in &changed_rows {
                 // Find pane position in layout to compute screen row
@@ -960,14 +915,17 @@ fn handle_server_message(
                         let screen_row = pane.y + pane_row.row_idx;
 
                         // Get the full row from screen buffer and render it
-                        if let Some(row_cells) = screen_buffer.get_row(screen_row as usize) {
+                        // (render_row_ansi also emits OSC 8 hyperlinks).
+                        if screen_buffer.get_row(screen_row as usize).is_some() {
                             queue!(stdout, MoveTo(X_OFFSET, Y_OFFSET + screen_row))?;
-                            let ansi = cells_to_ansi(row_cells);
+                            let ansi = screen_buffer.render_row_ansi(screen_row as usize);
                             write!(stdout, "{}", ansi)?;
                         }
                     }
                 }
             }
+
+            write!(stdout, "{}", END_SYNC_UPDATE)?;
 
             // Store cursor position if provided (for focused pane)
             // We don't position it immediately because subsequent pane updates might
@@ -1003,9 +961,54 @@ fn handle_server_message(
     }
 }
 
+/// Translate a mouse event to a position inside the border, or `None` if it
+/// landed on the border itself.
+fn inner_position(mouse: &MouseEvent) -> Option<(usize, usize)> {
+    const X_OFFSET: u16 = 1;
+    const Y_OFFSET: u16 = 1;
+
+    let row = mouse.row.checked_sub(Y_OFFSET)?;
+    let col = mouse.column.checked_sub(X_OFFSET)?;
+
+    Some((row as usize, col as usize))
+}
+
+/// Repaint the screen and put the cursor back where the focused pane wants it.
+fn repaint(stdout: &mut io::Stdout, screen_buffer: &ScreenBuffer) -> anyhow::Result<()> {
+    render_screen_buffer(stdout, screen_buffer)?;
+
+    let cursor = screen_buffer.cursor();
+    if cursor.visible {
+        crossterm::execute!(
+            stdout,
+            crossterm::cursor::MoveTo(cursor.col, cursor.row),
+            crossterm::cursor::Show,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Copy the current selection to the host terminal's clipboard.
+///
+/// Best-effort: a terminal that refuses clipboard writes should not take the
+/// session down with it.
+fn copy_selection(stdout: &mut io::Stdout, screen_buffer: &ScreenBuffer) {
+    let Some(text) = screen_buffer.selected_text() else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+
+    match clipboard::copy_to_host(stdout, &text) {
+        Ok(()) => log::info!("Copied {} bytes to the host clipboard", text.len()),
+        Err(e) => log::warn!("Clipboard copy failed: {}", e),
+    }
+}
+
 /// Render the entire screen buffer to stdout.
 /// Used after layout changes.
-#[allow(dead_code)]
 fn render_screen_buffer(
     stdout: &mut io::Stdout,
     screen_buffer: &ScreenBuffer,
@@ -1015,13 +1018,19 @@ fn render_screen_buffer(
 
     let (_screen_cols, screen_rows) = screen_buffer.dimensions();
 
+    // One frame for the whole screen: a full repaint is the most visible place
+    // for tearing.
+    write!(stdout, "{}", BEGIN_SYNC_UPDATE)?;
+
     for row_idx in 0..screen_rows {
-        if let Some(row_cells) = screen_buffer.get_row(row_idx) {
+        if screen_buffer.get_row(row_idx).is_some() {
             queue!(stdout, MoveTo(X_OFFSET, Y_OFFSET + row_idx as u16))?;
-            let ansi = cells_to_ansi(row_cells);
+            let ansi = screen_buffer.render_row_ansi(row_idx);
             write!(stdout, "{}", ansi)?;
         }
     }
+
+    write!(stdout, "{}", END_SYNC_UPDATE)?;
 
     stdout.flush()?;
     Ok(())
@@ -1033,6 +1042,8 @@ enum InternalAction {
     Detach,
     Quit,
     SendPrefix,
+    /// Scroll the focused pane: positive back in history, 0 returns to live.
+    Scroll(i32),
     Command(CommandAction),
 }
 
@@ -1040,6 +1051,10 @@ enum InternalAction {
 fn key_to_command_action(key: &event::KeyEvent, config: &Config) -> Option<InternalAction> {
     let key_char = match key.code {
         KeyCode::Char(c) => Some(c),
+        KeyCode::PageUp => return Some(InternalAction::Scroll(PAGE_LINES)),
+        KeyCode::PageDown => return Some(InternalAction::Scroll(-PAGE_LINES)),
+        // Back to the live view.
+        KeyCode::End => return Some(InternalAction::Scroll(0)),
         KeyCode::Up => {
             return Some(InternalAction::Command(CommandAction::NavigatePane(
                 Direction::Up,

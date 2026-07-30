@@ -4,19 +4,26 @@
 //! screen updates to the host terminal.
 
 mod connection;
+pub mod mouse;
 mod remote;
 pub mod screen;
 
 pub use connection::ServerConnection;
-pub use screen::{cells_to_ansi, ScreenBuffer};
+pub use mouse::encode_mouse_sgr;
+pub use screen::{
+    cells_to_ansi, cells_to_ansi_with_links, ScreenBuffer, BEGIN_SYNC_UPDATE, END_SYNC_UPDATE,
+};
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::protocol::{ClientCapabilities, ClientMessage, ServerMessage, PROTOCOL_VERSION};
+use crate::protocol::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 use crate::server::default_socket_path;
+
+/// Name of the server binary the client spawns on first use.
+const SERVER_BINARY: &str = "clux-server";
 
 use self::remote::{
     bootstrap_remote_server, connect_remote_stdio_bridge, start_remote_server, start_ssh_tunnel,
@@ -315,13 +322,15 @@ impl Client {
     }
 
     /// Start the local server process in the background.
+    ///
+    /// The server is a sibling of the client binary in a normal install, but not
+    /// when the client runs from somewhere else (a test harness, a symlink into a
+    /// bin directory), so fall back to `$PATH` rather than failing outright.
     fn start_local_server(socket_path: &Path) -> io::Result<()> {
-        let server_path = std::env::current_exe()?
-            .parent()
-            .map(|p| p.join("clux-server"))
-            .unwrap_or_else(|| PathBuf::from("clux-server"));
-
+        let server_path = Self::server_binary_path();
         let socket_arg = socket_path.to_string_lossy().to_string();
+
+        log::info!("Starting local server: {:?}", server_path);
 
         Command::new(&server_path)
             .arg("--socket")
@@ -336,6 +345,19 @@ impl Client {
         Ok(())
     }
 
+    /// Locate the `clux-server` binary: next to this executable if it is there,
+    /// otherwise by name so `$PATH` resolves it.
+    fn server_binary_path() -> PathBuf {
+        let sibling = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(SERVER_BINARY)));
+
+        match sibling {
+            Some(path) if path.is_file() => path,
+            _ => PathBuf::from(SERVER_BINARY),
+        }
+    }
+
     /// Perform the initial handshake with the server.
     fn handshake(&mut self) -> ClientResult<()> {
         let hello = ClientMessage::Hello {
@@ -343,9 +365,6 @@ impl Client {
             term_cols: self.config.term_cols,
             term_rows: self.config.term_rows,
             term_type: self.config.term_type.clone(),
-            capabilities: Some(ClientCapabilities {
-                supports_pane_updates: true,
-            }),
         };
         self.connection.send(&hello)?;
 
@@ -388,7 +407,6 @@ impl Client {
             ServerMessage::Attached {
                 session_id,
                 session_name,
-                needs_full_redraw: _,
             } => {
                 log::info!("Attached to session '{}' (id={})", session_name, session_id);
                 self.session_id = Some(session_id);
@@ -421,9 +439,7 @@ impl Client {
                     return Ok(());
                 }
                 ServerMessage::Error { message } => return Err(ClientError::ServerError(message)),
-                ServerMessage::FullScreen { .. }
-                | ServerMessage::Update { .. }
-                | ServerMessage::MouseMode { .. }
+                ServerMessage::MouseMode { .. }
                 | ServerMessage::LayoutChanged { .. }
                 | ServerMessage::PaneUpdate { .. } => {
                     log::debug!("Ignoring async message while waiting for detach confirmation");
@@ -445,6 +461,15 @@ impl Client {
         self.config.term_rows = rows;
         self.connection
             .send(&ClientMessage::Resize { cols, rows })?;
+        Ok(())
+    }
+
+    /// Scroll the focused pane's view.
+    ///
+    /// Positive goes back in history, negative comes forward, zero returns to the
+    /// live view.
+    pub fn send_scroll(&mut self, lines: i32) -> ClientResult<()> {
+        self.connection.send(&ClientMessage::Scroll { lines })?;
         Ok(())
     }
 

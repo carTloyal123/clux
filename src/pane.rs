@@ -3,9 +3,6 @@
 //! Implements a tree-based layout system similar to tmux, where panes can be
 //! split horizontally or vertically, and each pane contains its own terminal.
 
-// Some methods are kept for future use / API completeness
-#![allow(dead_code)]
-
 use std::os::unix::io::RawFd;
 
 use crate::pty::{Pty, PtySize};
@@ -239,23 +236,6 @@ impl LayoutNode {
             }
         }
     }
-
-    /// Get all pane IDs in this layout.
-    pub fn pane_ids(&self) -> Vec<PaneId> {
-        let mut ids = Vec::new();
-        self.collect_pane_ids(&mut ids);
-        ids
-    }
-
-    fn collect_pane_ids(&self, ids: &mut Vec<PaneId>) {
-        match self {
-            LayoutNode::Pane(id) => ids.push(*id),
-            LayoutNode::Split { first, second, .. } => {
-                first.collect_pane_ids(ids);
-                second.collect_pane_ids(ids);
-            }
-        }
-    }
 }
 
 impl Clone for LayoutNode {
@@ -297,7 +277,6 @@ pub struct PaneManager {
 
 impl PaneManager {
     /// Create a new pane manager with a single pane (uses pane ID 0).
-    #[allow(dead_code)]
     pub fn new(width: u16, height: u16, shell: &str) -> anyhow::Result<Self> {
         Self::new_with_pane_id(width, height, shell, 0)
     }
@@ -337,16 +316,6 @@ impl PaneManager {
         self.panes.get_mut(&self.focused)
     }
 
-    /// Get a pane by ID.
-    pub fn get_pane(&self, id: PaneId) -> Option<&Pane> {
-        self.panes.get(&id)
-    }
-
-    /// Get a pane mutably by ID.
-    pub fn get_pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
-        self.panes.get_mut(&id)
-    }
-
     /// Get all panes.
     pub fn panes(&self) -> impl Iterator<Item = &Pane> {
         self.panes.values()
@@ -355,11 +324,6 @@ impl PaneManager {
     /// Check if a pane with the given ID exists.
     pub fn has_pane(&self, id: PaneId) -> bool {
         self.panes.contains_key(&id)
-    }
-
-    /// Get all panes mutably.
-    pub fn panes_mut(&mut self) -> impl Iterator<Item = &mut Pane> {
-        self.panes.values_mut()
     }
 
     /// Get all panes as a vector.
@@ -378,7 +342,6 @@ impl PaneManager {
     }
 
     /// Split the focused pane using an internally generated ID.
-    #[allow(dead_code)]
     pub fn split(&mut self, direction: SplitDirection) -> anyhow::Result<PaneId> {
         let new_id = self.next_id;
         self.next_id += 1;
