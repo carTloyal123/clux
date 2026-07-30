@@ -24,7 +24,7 @@ pub use pin::Pin;
 
 use std::collections::VecDeque;
 
-use page::{Page, ROWS_PER_PAGE};
+use page::Page;
 use pin::Viewport;
 
 use crate::cell::Cell;
@@ -114,7 +114,7 @@ impl Buffer {
     /// Rows per page, exposed for the budget tests.
     #[cfg(test)]
     pub(crate) fn rows_per_page() -> usize {
-        ROWS_PER_PAGE
+        page::ROWS_PER_PAGE
     }
 
     /// Rows the buffer may hold in total, derived from the byte budget.

@@ -2,8 +2,6 @@
 
 use super::*;
 
-use super::*;
-
 #[test]
 fn test_cell_default() {
     let cell = Cell::default();
@@ -48,8 +46,6 @@ fn test_cell_flags() {
     assert!(flags.contains(CellFlags::UNDERLINE));
     assert!(!flags.contains(CellFlags::ITALIC));
 }
-
-use super::*;
 
 /// The cell is copied per character into every pane's history, so its size is
 /// the dominant memory cost of the whole program. Guard it deliberately.
