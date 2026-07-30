@@ -3,33 +3,30 @@
 //! The client connects to the server, sends input, and renders
 //! screen updates to the host terminal.
 
+mod connect;
+mod connect_remote;
 mod connection;
+mod error;
 pub mod mouse;
 mod remote;
 mod requests;
 pub mod screen;
 
 pub use connection::ServerConnection;
+pub use error::{ClientError, ClientResult};
 pub use mouse::encode_mouse_sgr;
 pub use screen::{
     cells_to_ansi, cells_to_ansi_with_links, ScreenBuffer, BEGIN_SYNC_UPDATE, END_SYNC_UPDATE,
 };
 
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
 
-use crate::protocol::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 use crate::server::default_socket_path;
 
 /// Name of the server binary the client spawns on first use.
 const SERVER_BINARY: &str = "clux-server";
 
-use self::remote::{
-    bootstrap_remote_server, connect_remote_stdio_bridge, start_remote_server, start_ssh_tunnel,
-    wait_for_remote_socket, SshTunnel,
-};
+use self::remote::SshTunnel;
 
 /// Where the client should connect.
 #[derive(Debug, Clone)]
@@ -87,73 +84,6 @@ impl Default for ClientConfig {
     }
 }
 
-/// Client error type.
-#[derive(Debug, thiserror::Error)]
-pub enum ClientError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("Protocol error: {0}")]
-    Protocol(#[from] crate::protocol::ProtocolError),
-
-    #[error("Server not running and failed to start")]
-    ServerNotRunning,
-
-    #[error("Connection failed after {0} attempts")]
-    ConnectionFailed(u32),
-
-    #[error("Handshake failed: {0}")]
-    HandshakeFailed(String),
-
-    #[error("Session not found: {0}")]
-    SessionNotFound(String),
-
-    #[error("Server error: {0}")]
-    ServerError(String),
-
-    #[error("Unexpected response: {0:?}")]
-    UnexpectedResponse(ServerMessage),
-
-    #[error("Disconnected: {0}")]
-    Disconnected(String),
-
-    #[error("ssh is required for --remote mode but was not found in PATH")]
-    SshUnavailable,
-
-    #[error("Failed to start remote server: {0}")]
-    RemoteStartupFailed(String),
-
-    #[error("SSH tunnel failed: {0}")]
-    RemoteTunnelFailed(String),
-
-    #[error("Unsupported remote platform: {os}/{arch}")]
-    RemotePlatformUnsupported { os: String, arch: String },
-
-    #[error("No release artifact found for clux-server v{version} ({target}) at {url}")]
-    RemoteArtifactUnavailable {
-        version: String,
-        target: String,
-        url: String,
-    },
-
-    #[error("Remote bootstrap failed: {0}")]
-    RemoteBootstrapFailed(String),
-
-    #[error("Neither curl nor wget is available on the remote host")]
-    RemoteMissingDownloadTool,
-
-    #[error("Invalid repository metadata for remote bootstrap: {0}")]
-    InvalidRepositoryMetadata(String),
-
-    #[error(
-        "Server protocol version {actual} does not support this operation (requires {required})"
-    )]
-    UnsupportedServerVersion { required: u32, actual: u32 },
-}
-
-/// Result type for client operations.
-pub type ClientResult<T> = Result<T, ClientError>;
-
 /// The clux client.
 pub struct Client {
     /// Client configuration.
@@ -171,231 +101,6 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to the server, optionally starting it if not running.
-    pub fn connect(config: ClientConfig, start_server: bool) -> ClientResult<Self> {
-        let (connection, tunnel) = match &config.target {
-            ClientTarget::Local { socket_path } => (
-                Self::connect_local_with_retry(socket_path, start_server)?,
-                None,
-            ),
-            ClientTarget::RemoteSsh {
-                destination,
-                socket_path,
-            } => {
-                if start_server {
-                    let bootstrap =
-                        bootstrap_remote_server(destination, env!("CARGO_PKG_VERSION"))?;
-                    if bootstrap.installed {
-                        eprintln!(
-                            "Installing clux-server v{} on {} ({})...",
-                            env!("CARGO_PKG_VERSION"),
-                            destination,
-                            bootstrap.platform.target_triple
-                        );
-                    }
-                    start_remote_server(destination, socket_path, &bootstrap.binary_path)?;
-                    wait_for_remote_socket(destination, socket_path)?;
-                }
-                let mut endpoint = start_ssh_tunnel(destination, socket_path)?;
-                let connection = Self::connect_remote_with_retry(
-                    destination,
-                    socket_path,
-                    &endpoint.connect_socket_path,
-                    &mut endpoint.tunnel,
-                    start_server,
-                )?;
-                (connection, Some(endpoint.tunnel))
-            }
-        };
-
-        let mut client = Self {
-            config,
-            connection,
-            tunnel,
-            server_version: PROTOCOL_VERSION,
-            session_id: None,
-            session_name: None,
-        };
-
-        if let Err(err) = client.handshake() {
-            if start_server && client.try_remote_stdio_fallback(&err)? {
-                client.handshake()?;
-                return Ok(client);
-            }
-            let remote_no_autostart =
-                matches!(client.config.target, ClientTarget::RemoteSsh { .. }) && !start_server;
-            if remote_no_autostart && is_connection_failure(&err) {
-                return Err(ClientError::ConnectionFailed(1));
-            }
-            return Err(err);
-        }
-
-        Ok(client)
-    }
-
-    fn try_remote_stdio_fallback(&mut self, err: &ClientError) -> ClientResult<bool> {
-        let (destination, socket_path) = match (&self.config.target, self.tunnel.is_some()) {
-            (
-                ClientTarget::RemoteSsh {
-                    destination,
-                    socket_path,
-                },
-                true,
-            ) if should_retry_remote_over_stdio(err) => (destination.clone(), socket_path.clone()),
-            _ => return Ok(false),
-        };
-
-        log::warn!(
-            "Remote handshake over SSH tunnel failed ({}), retrying with stdio bridge",
-            err
-        );
-        self.tunnel = None;
-        self.connection =
-            connect_remote_stdio_bridge(&destination, env!("CARGO_PKG_VERSION"), &socket_path)?;
-        Ok(true)
-    }
-
-    /// Connect to a local server with retry logic.
-    fn connect_local_with_retry(
-        socket_path: &Path,
-        start_server: bool,
-    ) -> ClientResult<ServerConnection> {
-        const MAX_RETRIES: u32 = 10;
-        const RETRY_DELAY: Duration = Duration::from_millis(100);
-
-        for attempt in 0..MAX_RETRIES {
-            match ServerConnection::connect(socket_path) {
-                Ok(conn) => return Ok(conn),
-                Err(e) => {
-                    if attempt == 0 && start_server {
-                        log::info!("Server not running, attempting to start...");
-                        if let Err(err) = Self::start_local_server(socket_path) {
-                            log::warn!("Failed to start server: {}", err);
-                        }
-                    }
-
-                    if attempt < MAX_RETRIES - 1 {
-                        log::debug!("Connection attempt {} failed: {}", attempt + 1, e);
-                        std::thread::sleep(RETRY_DELAY);
-                    }
-                }
-            }
-        }
-
-        Err(ClientError::ConnectionFailed(MAX_RETRIES))
-    }
-
-    /// Connect to a remote server through an existing SSH tunnel.
-    fn connect_remote_with_retry(
-        destination: &str,
-        remote_socket_path: &Path,
-        local_forward_socket_path: &Path,
-        tunnel: &mut SshTunnel,
-        start_server: bool,
-    ) -> ClientResult<ServerConnection> {
-        const MAX_RETRIES: u32 = 10;
-        const RETRY_DELAY: Duration = Duration::from_millis(100);
-
-        for attempt in 0..MAX_RETRIES {
-            tunnel.ensure_running()?;
-
-            match ServerConnection::connect(local_forward_socket_path) {
-                Ok(conn) => return Ok(conn),
-                Err(e) => {
-                    if attempt < MAX_RETRIES - 1 {
-                        log::debug!("Remote connection attempt {} failed: {}", attempt + 1, e);
-                        std::thread::sleep(RETRY_DELAY);
-                    }
-                }
-            }
-        }
-
-        if start_server {
-            Err(ClientError::RemoteStartupFailed(format!(
-                "failed to connect to remote server {}:{} after {} attempts",
-                destination,
-                remote_socket_path.display(),
-                MAX_RETRIES
-            )))
-        } else {
-            Err(ClientError::ConnectionFailed(MAX_RETRIES))
-        }
-    }
-
-    /// Start the local server process in the background.
-    ///
-    /// The server is a sibling of the client binary in a normal install, but not
-    /// when the client runs from somewhere else (a test harness, a symlink into a
-    /// bin directory), so fall back to `$PATH` rather than failing outright.
-    fn start_local_server(socket_path: &Path) -> io::Result<()> {
-        let server_path = Self::server_binary_path();
-        let socket_arg = socket_path.to_string_lossy().to_string();
-
-        log::info!("Starting local server: {:?}", server_path);
-
-        Command::new(&server_path)
-            .arg("--socket")
-            .arg(&socket_arg)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        std::thread::sleep(Duration::from_millis(200));
-
-        Ok(())
-    }
-
-    /// Locate the `clux-server` binary: next to this executable if it is there,
-    /// otherwise by name so `$PATH` resolves it.
-    fn server_binary_path() -> PathBuf {
-        let sibling = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join(SERVER_BINARY)));
-
-        match sibling {
-            Some(path) if path.is_file() => path,
-            _ => PathBuf::from(SERVER_BINARY),
-        }
-    }
-
-    /// Perform the initial handshake with the server.
-    fn handshake(&mut self) -> ClientResult<()> {
-        let hello = ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-            term_cols: self.config.term_cols,
-            term_rows: self.config.term_rows,
-            term_type: self.config.term_type.clone(),
-        };
-        self.connection.send(&hello)?;
-
-        let response = self.connection.recv()?;
-        match response {
-            ServerMessage::HelloAck {
-                version,
-                server_pid,
-            } => {
-                self.server_version = version;
-                log::info!(
-                    "Connected to server (pid={}, version={})",
-                    server_pid,
-                    version
-                );
-
-                if version != PROTOCOL_VERSION {
-                    log::warn!(
-                        "Protocol version mismatch: client={}, server={}",
-                        PROTOCOL_VERSION,
-                        version
-                    );
-                }
-                Ok(())
-            }
-            ServerMessage::Error { message } => Err(ClientError::HandshakeFailed(message)),
-            other => Err(ClientError::UnexpectedResponse(other)),
-        }
-    }
-
     /// Get the target server socket path.
     pub fn socket_path(&self) -> &Path {
         self.config.target.socket_path()
@@ -405,29 +110,6 @@ impl Client {
     pub fn remote_destination(&self) -> Option<&str> {
         self.config.target.remote_destination()
     }
-}
-
-fn is_connection_failure(err: &ClientError) -> bool {
-    match err {
-        ClientError::Protocol(crate::protocol::ProtocolError::ConnectionClosed) => true,
-        ClientError::Protocol(crate::protocol::ProtocolError::Io(io_err)) => matches!(
-            io_err.kind(),
-            io::ErrorKind::BrokenPipe
-                | io::ErrorKind::ConnectionRefused
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::NotFound
-        ),
-        _ => false,
-    }
-}
-
-fn should_retry_remote_over_stdio(err: &ClientError) -> bool {
-    matches!(
-        err,
-        ClientError::Protocol(crate::protocol::ProtocolError::ConnectionClosed)
-            | ClientError::RemoteTunnelFailed(_)
-            | ClientError::RemoteStartupFailed(_)
-    )
 }
 
 #[cfg(test)]
