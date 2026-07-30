@@ -337,3 +337,85 @@ jobs:
           files: |
             release/*.tar.gz
             release/SHA256SUMS
+
+  # Point the Homebrew tap at the release just published. Every main push cuts a
+  # version, so a pinned formula would fall behind immediately - this rewrites it
+  # each time from the release's own SHA256SUMS. Pushes via a write deploy key
+  # (HOMEBREW_TAP_DEPLOY_KEY) on carTloyal123/homebrew-clux.
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs:
+      - publish-release
+      - prepare-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Rewrite and push the formula
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Pull the checksums the publish step generated for this release.
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern SHA256SUMS --dir sums
+          arm_sha="$(awk '/aarch64-apple-darwin/ {print $1}' sums/SHA256SUMS)"
+          x86_sha="$(awk '/x86_64-apple-darwin/ {print $1}' sums/SHA256SUMS)"
+          if [[ -z "${arm_sha}" || -z "${x86_sha}" ]]; then
+            echo "Missing macOS checksums in the release" >&2
+            cat sums/SHA256SUMS >&2
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_KEY}" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o StrictHostKeyChecking=accept-new"
+
+          git clone git@github.com:carTloyal123/homebrew-clux.git tap
+          base="https://github.com/carTloyal123/clux/releases/download/v${VERSION}"
+
+          cat > tap/Formula/clux.rb <<EOF
+          class Clux < Formula
+            desc "Terminal multiplexer with reliable hyperlinks, scrollback, and fast rendering"
+            homepage "https://github.com/carTloyal123/clux"
+            version "${VERSION}"
+            license "MIT"
+
+            # Prebuilt bottles from the clux release pipeline. Each archive holds both
+            # the clux client and the clux-server it spawns as a sibling.
+            on_macos do
+              on_arm do
+                url "${base}/clux-v${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${arm_sha}"
+              end
+              on_intel do
+                url "${base}/clux-v${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${x86_sha}"
+              end
+            end
+
+            def install
+              bin.install "clux"
+              bin.install "clux-server"
+            end
+
+            test do
+              assert_match "clux #{version}", shell_output("#{bin}/clux --version")
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/clux.rb
+          if git diff --cached --quiet; then
+            echo "Formula already current for v${VERSION}"
+            exit 0
+          fi
+          git commit -m "clux ${VERSION}"
+          git push origin HEAD
