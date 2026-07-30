@@ -3,7 +3,7 @@
 //! These tests verify that pane splitting, navigation, and layout
 //! work correctly together.
 
-use clux::pane::{Direction, PaneManager, Rect, SplitDirection};
+use clux::pane::Rect;
 
 /// Helper to create a PaneManager without actually spawning a shell.
 /// For integration tests, we'll test the layout logic directly.

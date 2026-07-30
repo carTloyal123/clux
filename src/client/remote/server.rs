@@ -1,7 +1,7 @@
 //! Starting the remote server and connecting to it.
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 
 use super::bootstrap::bootstrap_remote_server;
 use super::ssh::{run_remote_shell, spawn_ssh};
@@ -122,11 +122,4 @@ pub fn connect_remote_stdio_bridge(
         crate::protocol::ProtocolError::Io(io_err) => ClientError::Io(io_err),
         other => ClientError::RemoteTunnelFailed(other.to_string()),
     })
-}
-fn run_remote_shell_capture(
-    destination: &str,
-    script: &str,
-    args: &[String],
-) -> ClientResult<Output> {
-    run_remote_shell(destination, script, args)
 }

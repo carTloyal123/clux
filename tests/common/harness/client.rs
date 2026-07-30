@@ -2,18 +2,13 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader};
-use std::os::unix::fs::symlink;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Child;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use clux::client::{Client, ClientConfig, ClientTarget, ScreenBuffer};
-use clux::protocol::{CommandAction, Direction, ServerMessage, WindowLayout};
-use clux::selection::SelectionMode;
+use clux::protocol::{CommandAction, Direction};
 
 use super::helpers::*;
 use super::types::*;

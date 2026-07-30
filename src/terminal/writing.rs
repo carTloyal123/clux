@@ -1,7 +1,7 @@
 //! Writing to the screen: characters, scrolling, styling, modes.
 
 use crate::buffer::Buffer;
-use crate::cell::{Cell, CellFlags, Color};
+use crate::cell::Cell;
 
 use super::Terminal;
 

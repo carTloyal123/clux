@@ -4,7 +4,7 @@
 //! attaches to a session, and handles input/output.
 
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io;
 
 use crossterm::style::Color;
 use crossterm::terminal::{self, disable_raw_mode};
@@ -26,13 +26,8 @@ mod render;
 #[cfg(test)]
 mod tests;
 
-use border::*;
 use cli::*;
 use commands::*;
-use keys::*;
-use lifecycle::*;
-use messages::*;
-use mouse::*;
 
 pub(crate) const SERVER_TOKEN: Token = Token(0);
 

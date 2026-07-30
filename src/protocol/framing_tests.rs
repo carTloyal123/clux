@@ -1,7 +1,7 @@
 //! Framing tests.
 
 use super::*;
-use std::io::{self, Cursor, Write};
+use std::io::Cursor;
 
 // ------------------------------------------------------------------------
 // Serialization Round-Trip Tests

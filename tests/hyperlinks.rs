@@ -3,7 +3,6 @@
 mod common;
 
 use common::harness::*;
-use std::thread;
 use std::time::Duration;
 
 // Hyperlink Tests

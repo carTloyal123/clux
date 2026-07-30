@@ -2,9 +2,7 @@
 
 mod common;
 
-use clux::client::Client;
 use common::harness::*;
-use std::thread;
 use std::time::Duration;
 
 // Scrollback Tests

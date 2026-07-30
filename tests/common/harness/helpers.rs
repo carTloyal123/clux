@@ -2,20 +2,14 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader};
-use std::os::unix::fs::symlink;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clux::client::{Client, ClientConfig, ClientTarget, ScreenBuffer};
-use clux::protocol::{CommandAction, Direction, ServerMessage, WindowLayout};
-use clux::selection::SelectionMode;
+use clux::client::{Client, ClientConfig, ClientTarget};
+use clux::protocol::ServerMessage;
 
-use super::client::*;
 use super::types::*;
 
 pub fn unique_socket_path() -> PathBuf {

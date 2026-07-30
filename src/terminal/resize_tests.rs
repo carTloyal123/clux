@@ -1,6 +1,5 @@
 //! Resize and reflow tests.
 
-use super::test_support::*;
 use super::*;
 
 #[test]
@@ -65,7 +64,7 @@ fn test_scroll_offset_preserved_on_resize() {
     );
 }
 
-/// Fill the scrollback by pushing `count` lines out of the top of the grid.#[test]
+#[test]
 fn test_resize_shrink_preserves_content_via_scrollback() {
     let mut term = Terminal::new(24, 80);
 

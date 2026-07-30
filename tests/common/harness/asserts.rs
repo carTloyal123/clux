@@ -1,19 +1,7 @@
 //! Assertions and hyperlink extraction for tests.
 
 use super::client::*;
-use super::helpers::*;
-use super::types::*;
-use clux::client::{Client, ClientConfig, ClientTarget, ScreenBuffer};
-use clux::protocol::{CommandAction, Direction, ServerMessage, WindowLayout};
-use clux::selection::SelectionMode;
-use std::io::{BufRead, BufReader};
-use std::os::unix::fs::symlink;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::io::BufRead;
 
 pub fn assert_pane_count(client: &TestClient, expected: usize) {
     let actual = client.pane_count();

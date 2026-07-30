@@ -43,7 +43,7 @@ fn test_cursor_movement_via_parser() {
     assert_eq!(term.cursor.row, 9);
 }
 
-/// Feed bytes through a real VTE parser, as the server does.#[test]
+#[test]
 fn test_osc8_hyperlink_marks_cells() {
     let mut term = Terminal::new(24, 80);
     feed(

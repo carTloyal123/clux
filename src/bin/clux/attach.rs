@@ -7,11 +7,10 @@ use crate::lifecycle::*;
 use crate::messages::*;
 use crate::mouse::*;
 use crate::*;
-use std::io::{self, Write};
+use std::io::Write;
 use std::time::Duration;
 
 use crossterm::event::{self, Event};
-use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll};
 

@@ -8,7 +8,7 @@
 //! - Resize operations should be quick
 
 use clux::Terminal;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, Criterion, Throughput};
 
 pub fn bench_parse_plain_text(c: &mut Criterion) {
     let mut group = c.benchmark_group("terminal_parse");

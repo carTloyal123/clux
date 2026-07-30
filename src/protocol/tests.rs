@@ -1,7 +1,6 @@
 //! Protocol round-trip and framing tests.
 
 use super::*;
-use crate::cell::Cell;
 use std::io::Cursor;
 
 // ------------------------------------------------------------------------

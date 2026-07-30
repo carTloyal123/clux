@@ -74,7 +74,6 @@ pub(crate) fn drain_server_messages(
             Err(e) => {
                 log::error!("Error receiving from server: {}", e);
                 return Ok(false);
-                break;
             }
         }
     }

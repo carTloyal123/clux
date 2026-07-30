@@ -2,7 +2,6 @@
 
 use super::super::*;
 use super::test_support::*;
-use crate::cell::CellFlags;
 use crate::protocol::{PaneLayout, PaneRow, WindowLayout};
 
 #[test]

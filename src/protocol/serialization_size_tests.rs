@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::cell::Cell;
-use std::io::Cursor;
 
 // ------------------------------------------------------------------------
 // Serialization Round-Trip Tests

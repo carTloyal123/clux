@@ -3,12 +3,9 @@
 //! Implements the VTE Perform trait to handle ANSI escape sequences.
 //! Manages cursor position, colors, and grid updates.
 
-use std::collections::HashMap;
-
-use crate::buffer::{Buffer, ViewRow};
+use crate::buffer::Buffer;
 use crate::cell::{CellFlags, Color, HyperlinkId};
 use crate::hyperlink::HyperlinkStore;
-use crate::urls::LinkRun;
 
 /// Memory a pane may spend on history.
 ///

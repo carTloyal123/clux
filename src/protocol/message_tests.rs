@@ -1,7 +1,6 @@
 //! Message round-trip tests.
 
 use super::*;
-use crate::cell::Cell;
 
 // ------------------------------------------------------------------------
 // Serialization Round-Trip Tests

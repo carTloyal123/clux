@@ -2,12 +2,8 @@
 
 mod common;
 
-use clux::client::{Client, ClientConfig, ClientTarget};
-use common::harness::*;
+use clux::client::Client;
 use common::ssh::*;
-use std::path::PathBuf;
-use std::thread;
-use std::time::Duration;
 
 // Remote SSH Tests
 // ============================================================================

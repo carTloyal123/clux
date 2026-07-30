@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use super::Terminal;
 use crate::buffer::ViewRow;
 use crate::urls::LinkRun;
 impl super::Terminal {

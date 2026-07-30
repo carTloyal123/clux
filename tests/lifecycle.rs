@@ -2,8 +2,7 @@
 
 mod common;
 
-use clux::client::Client;
-use clux::protocol::{CommandAction, ServerMessage};
+use clux::protocol::CommandAction;
 use common::harness::*;
 use std::path::PathBuf;
 use std::thread;

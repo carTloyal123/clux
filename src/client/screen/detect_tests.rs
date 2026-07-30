@@ -3,7 +3,7 @@
 use super::super::*;
 use super::test_support::*;
 use crate::cell::CellFlags;
-use crate::protocol::{PaneLayout, PaneRow, WindowLayout};
+use crate::protocol::PaneRow;
 
 #[test]
 fn test_detected_url_is_underlined() {

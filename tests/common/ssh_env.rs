@@ -1,19 +1,11 @@
 //! The fake ssh environment: sets PATH and runs a server.
 
-use super::harness::{start_server, unique_socket_path, wait_for_socket, TestError, SSH_ENV_LOCK};
-use clux::client::{Client, ClientConfig, ClientTarget, ScreenBuffer};
-use clux::protocol::{CommandAction, Direction, ServerMessage, WindowLayout};
-use clux::selection::SelectionMode;
-use std::io::{BufRead, BufReader};
-use std::os::unix::fs::symlink;
+use super::harness::{TestError, SSH_ENV_LOCK};
+use clux::client::{Client, ClientConfig, ClientTarget};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
 
-use super::harness::*;
 use super::ssh::{FakeSshEnv, FakeSshOptions};
 use super::ssh_fixtures::*;
 

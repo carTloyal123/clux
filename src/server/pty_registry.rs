@@ -1,7 +1,5 @@
 //! Registering pane PTYs with the poll loop.
 
-use std::os::unix::io::AsRawFd;
-
 use mio::unix::SourceFd;
 use mio::{Interest, Token};
 

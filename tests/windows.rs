@@ -2,9 +2,7 @@
 
 mod common;
 
-use clux::protocol::Direction;
 use common::harness::*;
-use std::thread;
 use std::time::Duration;
 
 // Window Tests

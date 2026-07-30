@@ -1,8 +1,6 @@
 //! Emitting SGR color sequences.
 
 /// OSC 8 sequence that ends the current hyperlink.
-const CLOSE_HYPERLINK: &str = "\x1b]8;;\x1b\\";
-
 use crate::cell::Color;
 
 /// Append foreground color escape sequence.
