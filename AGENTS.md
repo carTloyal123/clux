@@ -4,7 +4,9 @@ Notes for agents (and humans) working in this repo.
 
 ## Pre-1.0: compatibility is not a constraint
 
-There will be no release until **1.0.0**. Until then:
+**Until 1.0.0, anything may change in any release.** Correctness beats
+compatibility every time: if the right model requires breaking the wire format,
+the config, the CLI or stored state, break it and move on. Until then:
 
 - **Break the wire protocol freely.** Bump `PROTOCOL_VERSION` in `src/protocol.rs`
   when the format changes and move on. Adding a field to a bincode message is a
@@ -16,9 +18,15 @@ There will be no release until **1.0.0**. Until then:
   talking to new ones.
 - **No deprecation paths for config, CLI flags, or protocol messages.** Rename or
   delete them outright rather than carrying an alias.
+- **Breaking changes ride the normal release.** Pushing to `main` runs CI, bumps
+  the patch version, tags it and publishes `clux-server` artifacts. A protocol
+  break or a storage rewrite goes out that way like anything else - no release
+  ceremony, no migration notes, no changelog promises.
+- **Don't spend effort on upgrade paths.** The remedy for a version mismatch is
+  `clux kill-server` and reattach. Say so in the commit message and move on.
 
-Prefer the clean design over the backwards-compatible one. Compatibility work
-starts at 1.0.0.
+Prefer the clean design over the backwards-compatible one. Compatibility work,
+deprecation policy and migration notes all start at 1.0.0.
 
 ## Minimal and simple: YAGNI, measure twice cut once
 
@@ -79,8 +87,10 @@ are touched:
 | `src/terminal.rs` | ~1200 | `terminal/` : `state.rs`, `perform.rs` (the VTE impl), `modes.rs` |
 | `src/config.rs` | ~980 | `config/` : `keys.rs`, `bindings.rs`, `sections.rs` |
 
-Everything else over the cap (`session`, `grid`, `pane`, `urls`, `client/remote`,
-`client/mod`, `cell`, benches) is smaller and can be split in passing.
+Everything else over the cap (`session`, `pane`, `client/remote`, `client/mod`,
+`client/connection`, `pty`, `selection`, `server/client_conn`, `server/listener`,
+`bin/clux-server`, `benches/terminal`, `tests/pane_integration`) is smaller and can
+be split in passing.
 
 ## One architecture: always client/server
 
