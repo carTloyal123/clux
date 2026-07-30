@@ -155,6 +155,6 @@ mod link_tests;
 #[cfg(test)]
 mod selection_tests;
 #[cfg(test)]
-mod update_tests;
-#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod update_tests;

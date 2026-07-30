@@ -74,23 +74,11 @@ Rules:
 - Unit tests count toward the file's budget. A module whose tests push it over is
   usually a module doing two things.
 
-Current debt, largest first - these predate the rule and are to be split as they
-are touched:
-
-| File | Lines | Suggested split |
-| --- | --- | --- |
-| `tests/integration.rs` | ~2270 | `tests/` by area: harness, lifecycle, panes, windows, hyperlinks, selection, scrollback, remote |
-| `src/server/mod.rs` | ~1840 | `server/` : `lifecycle.rs`, `clients.rs`, `commands.rs`, `panes.rs`, `broadcast.rs` |
-| `src/client/screen.rs` | ~1550 | `screen/` : `buffer.rs`, `links.rs`, `selection.rs`, `ansi.rs` |
-| `src/bin/clux.rs` | ~1500 | `client/` : `cli.rs`, `attach.rs` (event loop), `input.rs`, `border.rs` |
-| `src/protocol.rs` | ~1370 | `protocol/` : `messages.rs`, `rows.rs`, `framing.rs` |
-| `src/terminal.rs` | ~1200 | `terminal/` : `state.rs`, `perform.rs` (the VTE impl), `modes.rs` |
-| `src/config.rs` | ~980 | `config/` : `keys.rs`, `bindings.rs`, `sections.rs` |
-
-Everything else over the cap (`session`, `pane`, `client/remote`, `client/mod`,
-`client/connection`, `pty`, `selection`, `server/client_conn`, `server/listener`,
-`bin/clux-server`, `benches/terminal`, `tests/pane_integration`) is smaller and can
-be split in passing.
+Every `.rs` file in the tree is under the cap as of this writing. When a module
+grows past it, split by responsibility into a module directory (`terminal/` holding
+`csi.rs`, `osc.rs`, `sgr.rs`, `modes.rs`, ...) rather than appending. A crate root
+binary (`src/bin/clux.rs`) becomes a directory with `main.rs` so its submodules live
+beside it; the same applies to benches with a custom `path`.
 
 ## One architecture: always client/server
 

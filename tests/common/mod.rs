@@ -38,3 +38,5 @@ pub fn print_lines(term: &mut Terminal, count: usize) {
 
 pub mod harness;
 pub mod ssh;
+pub mod ssh_env;
+pub mod ssh_fixtures;

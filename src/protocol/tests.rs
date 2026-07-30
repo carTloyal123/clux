@@ -33,4 +33,3 @@ fn test_connection_closed_mid_payload_maps_to_connection_closed() {
 // ------------------------------------------------------------------------
 // Serialization Size Tests (for performance awareness)
 // ------------------------------------------------------------------------
-

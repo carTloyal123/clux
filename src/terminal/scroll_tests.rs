@@ -1,7 +1,7 @@
 //! Scrollback and resize tests.
 
-use super::*;
 use super::test_support::*;
+use super::*;
 
 #[test]
 fn test_scroll_view_clamps_to_recorded_history() {
@@ -121,4 +121,3 @@ fn test_explicit_osc8_links_resolve_in_history() {
         "an application's OSC 8 link should survive into the scrollback"
     );
 }
-

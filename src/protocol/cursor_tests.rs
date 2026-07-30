@@ -32,4 +32,3 @@ fn test_server_message_session_list_roundtrip() {
 
     assert_eq!(msg, deserialized);
 }
-

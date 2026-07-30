@@ -140,4 +140,3 @@ fn test_session_manager_rename_collision() {
 
     assert!(matches!(result, Err(SessionError::NameExists(_))));
 }
-

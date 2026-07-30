@@ -197,4 +197,3 @@ fn test_update_without_layout() {
     let row = buffer.get_row(0).unwrap();
     assert_eq!(row[0].c, ' ');
 }
-

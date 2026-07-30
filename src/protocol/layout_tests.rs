@@ -156,4 +156,3 @@ fn test_pane_row_links_roundtrip() {
 
     assert_eq!(msg, deserialized);
 }
-

@@ -52,4 +52,3 @@ fn test_cell_serialization_roundtrip() {
 
     assert_eq!(cell, deserialized);
 }
-

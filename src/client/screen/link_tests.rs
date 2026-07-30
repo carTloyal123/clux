@@ -178,4 +178,3 @@ fn test_url_with_control_characters_is_dropped() {
     assert_eq!(buffer.link_at(0, 0), None);
     assert!(!buffer.render_row_ansi(0).contains("\x1b]8;"));
 }
-

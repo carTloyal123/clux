@@ -1,7 +1,7 @@
 //! Resize and reflow tests.
 
-use super::*;
 use super::test_support::*;
+use super::*;
 
 #[test]
 fn test_resize() {

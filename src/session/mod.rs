@@ -172,9 +172,9 @@ pub enum SessionError {
 mod lookup;
 mod manager;
 #[cfg(test)]
-mod rename_tests;
-#[cfg(test)]
 mod manager_tests;
+#[cfg(test)]
+mod rename_tests;
 #[cfg(test)]
 mod tests;
 

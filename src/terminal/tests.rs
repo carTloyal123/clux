@@ -1,7 +1,7 @@
 //! Terminal parsing tests.
 
-use super::*;
 use super::test_support::*;
+use super::*;
 use crate::cell::ColorKind;
 
 #[test]
@@ -97,4 +97,3 @@ fn test_sgr() {
     term.handle_sgr(&[31]);
     assert_eq!(term.fg.kind, ColorKind::Indexed);
 }
-

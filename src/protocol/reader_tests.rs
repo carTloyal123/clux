@@ -156,4 +156,3 @@ fn test_message_writer_zero_write_is_connection_closed() {
     assert!(matches!(result, Err(ProtocolError::ConnectionClosed)));
     assert!(writer.has_pending());
 }
-

@@ -61,6 +61,7 @@ regex = "1.10"
 
 [[bench]]
 name = "terminal"
+path = "benches/terminal/main.rs"
 harness = false
 
 [[bench]]

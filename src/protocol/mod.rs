@@ -35,28 +35,28 @@ pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 // Client to Server Messages
 // ============================================================================
 
-mod framing;
 #[cfg(test)]
-mod reader_tests;
+mod cursor_tests;
+mod framing;
 #[cfg(test)]
 mod framing_tests;
 #[cfg(test)]
-mod size_tests;
-#[cfg(test)]
 mod layout_tests;
-#[cfg(test)]
-mod pane_update_tests;
 #[cfg(test)]
 mod message_tests;
 mod messages;
-mod rows;
-mod stream;
 #[cfg(test)]
-mod cursor_tests;
+mod pane_update_tests;
+#[cfg(test)]
+mod reader_tests;
+#[cfg(test)]
+mod roundtrip_tests;
+mod rows;
 #[cfg(test)]
 mod serialization_size_tests;
 #[cfg(test)]
-mod roundtrip_tests;
+mod size_tests;
+mod stream;
 #[cfg(test)]
 mod tests;
 

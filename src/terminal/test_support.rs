@@ -2,7 +2,6 @@
 
 use super::super::*;
 
-
 pub(super) fn feed(term: &mut Terminal, bytes: &[u8]) {
     let mut parser = vte::Parser::new();
     parser.advance(term, bytes);
@@ -14,7 +13,6 @@ pub(super) fn link_at(term: &Terminal, row: usize, col: usize) -> Option<&str> {
     term.hyperlinks.get(id)
 }
 
-
 pub(super) fn fill_scrollback(term: &mut Terminal, count: usize) {
     for i in 0..count {
         term.cursor.row = term.rows() - 1;
@@ -25,4 +23,3 @@ pub(super) fn fill_scrollback(term: &mut Terminal, count: usize) {
         }
     }
 }
-

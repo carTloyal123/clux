@@ -51,4 +51,3 @@ fn test_pane_update_without_cursor() {
 
     assert_eq!(msg, deserialized);
 }
-
