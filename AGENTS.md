@@ -97,9 +97,8 @@ The server's lifetime is driven by sessions, not clients (`AutoShutdownConfig`):
 | Last session closes (`<prefix> q`, or the last shell exits) | Server shuts down after `grace_period` |
 | Server started but no session within `first_session_timeout` | Server shuts down (orphan cleanup) |
 
-Those five rows are covered by the `Server Lifecycle Tests` section of
-`tests/integration.rs` against real server processes. If you change session or
-client teardown, run them.
+Those five rows are covered by `tests/lifecycle.rs` against real server processes.
+If you change session or client teardown, run them.
 
 A second renderer is how clux ended up shipping a client that silently dropped
 OSC 8 hyperlinks: the working implementation lived in an entry point that was not
