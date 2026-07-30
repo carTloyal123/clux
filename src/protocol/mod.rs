@@ -42,11 +42,11 @@ mod framing_tests;
 mod message_tests;
 mod messages;
 mod rows;
+mod stream;
 #[cfg(test)]
 mod tests;
 
-pub use framing::{
-    read_message, write_message, MessageReader, MessageWriter, ProtocolError, ProtocolResult,
-};
+pub use framing::{read_message, write_message, ProtocolError, ProtocolResult};
 pub use messages::{ClientMessage, CommandAction, DetachReason, Direction, ServerMessage};
 pub use rows::{CursorState, PaneLayout, PaneRow, RowLink, SessionInfo, WindowLayout};
+pub use stream::{MessageReader, MessageWriter};

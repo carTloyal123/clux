@@ -169,6 +169,7 @@ pub enum SessionError {
 // Tests
 // ============================================================================
 
+mod lookup;
 mod manager;
 #[cfg(test)]
 mod tests;

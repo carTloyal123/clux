@@ -23,7 +23,7 @@ pub struct ServerConnection {
     reader: MessageReader,
 }
 
-enum ConnectionTransport {
+pub(super) enum ConnectionTransport {
     Unix(UnixStream),
     SshStdio {
         child: Child,
@@ -92,102 +92,6 @@ impl ServerConnection {
         result
     }
 
-    /// Receive a message from the server (blocking).
-    pub fn recv(&mut self) -> ProtocolResult<ServerMessage> {
-        log::debug!("ServerConnection::recv (blocking)");
-
-        // First check if we have a complete message buffered
-        if let Some(msg) = self.try_recv_from_buffer()? {
-            log::debug!("Got message from buffer: {:?}", msg_type(&msg));
-            return Ok(msg);
-        }
-
-        // Read until we have a complete message
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.read_into(&mut buf) {
-                Ok(0) => {
-                    log::warn!("Connection closed (read returned 0)");
-                    return Err(ProtocolError::ConnectionClosed);
-                }
-                Ok(n) => {
-                    log::trace!("Read {} bytes from server", n);
-                    if let Some(msg) = self.reader.feed(&buf[..n])? {
-                        log::debug!("Received complete message: {:?}", msg_type(&msg));
-                        return Ok(msg);
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // Timeout waiting for data
-                    log::trace!("WouldBlock, continuing to wait...");
-                    continue;
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    log::error!("Read error: {}", e);
-                    return Err(ProtocolError::Io(e));
-                }
-            }
-        }
-    }
-
-    /// Try to receive a message (non-blocking).
-    /// Returns Ok(None) if no complete message is available.
-    pub fn try_recv(&mut self) -> ProtocolResult<Option<ServerMessage>> {
-        // Set non-blocking temporarily
-        self.set_nonblocking(true).map_err(ProtocolError::Io)?;
-
-        let result = self.try_recv_internal();
-
-        // Restore blocking mode
-        self.set_nonblocking(false).map_err(ProtocolError::Io)?;
-
-        if let Ok(Some(ref msg)) = result {
-            log::debug!("try_recv got message: {:?}", msg_type(msg));
-        }
-
-        result
-    }
-
-    /// Internal non-blocking receive.
-    fn try_recv_internal(&mut self) -> ProtocolResult<Option<ServerMessage>> {
-        // First check the buffer
-        if let Some(msg) = self.try_recv_from_buffer()? {
-            return Ok(Some(msg));
-        }
-
-        // Try to read more data
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.read_into(&mut buf) {
-                Ok(0) => {
-                    log::warn!("try_recv: Connection closed");
-                    return Err(ProtocolError::ConnectionClosed);
-                }
-                Ok(n) => {
-                    log::trace!("try_recv: Read {} bytes", n);
-                    if let Some(msg) = self.reader.feed(&buf[..n])? {
-                        return Ok(Some(msg));
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // No more data available
-                    return Ok(None);
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    log::error!("try_recv error: {}", e);
-                    return Err(ProtocolError::Io(e));
-                }
-            }
-        }
-    }
-
-    /// Try to parse a message from the buffer.
-    fn try_recv_from_buffer(&mut self) -> ProtocolResult<Option<ServerMessage>> {
-        self.reader.feed(&[])
-    }
-
     /// Get the raw file descriptor for polling.
     pub fn as_raw_fd(&self) -> RawFd {
         match &self.transport {
@@ -250,7 +154,7 @@ fn set_fd_nonblocking<T: AsRawFd>(fd_owner: &T, nonblocking: bool) -> io::Result
 }
 
 /// Helper to get a short description of a server message for logging.
-fn msg_type(msg: &ServerMessage) -> &'static str {
+pub(super) fn msg_type(msg: &ServerMessage) -> &'static str {
     match msg {
         ServerMessage::HelloAck { .. } => "HelloAck",
         ServerMessage::Attached { .. } => "Attached",
@@ -264,6 +168,8 @@ fn msg_type(msg: &ServerMessage) -> &'static str {
         ServerMessage::PaneUpdate { .. } => "PaneUpdate",
     }
 }
+
+mod recv;
 
 #[cfg(test)]
 mod tests;

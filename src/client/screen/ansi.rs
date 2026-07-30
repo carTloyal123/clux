@@ -8,6 +8,7 @@ const CLOSE_HYPERLINK: &str = "\x1b]8;;\x1b\\";
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::color::{append_bg_color, append_fg_color};
 use crate::cell::{Cell, CellFlags, Color};
 
 /// Convert a slice of cells to an ANSI escape sequence string.
@@ -139,72 +140,4 @@ pub fn cells_to_ansi_with_links(
     // Reset at end of row
     output.push_str("\x1b[0m");
     output
-}
-/// Append foreground color escape sequence.
-fn append_fg_color(output: &mut String, pending_codes: &[u8], color: &Color) {
-    use crate::cell::ColorKind;
-
-    // First emit any pending codes
-    if !pending_codes.is_empty() {
-        output.push_str("\x1b[");
-        for (i, code) in pending_codes.iter().enumerate() {
-            if i > 0 {
-                output.push(';');
-            }
-            output.push_str(&code.to_string());
-        }
-        output.push('m');
-    }
-
-    match color.kind {
-        ColorKind::Default => {
-            output.push_str("\x1b[39m");
-        }
-        ColorKind::Indexed => {
-            if color.r < 8 {
-                output.push_str(&format!("\x1b[{}m", 30 + color.r));
-            } else if color.r < 16 {
-                output.push_str(&format!("\x1b[{}m", 90 + color.r - 8));
-            } else {
-                output.push_str(&format!("\x1b[38;5;{}m", color.r));
-            }
-        }
-        ColorKind::Rgb => {
-            output.push_str(&format!("\x1b[38;2;{};{};{}m", color.r, color.g, color.b));
-        }
-    }
-}
-/// Append background color escape sequence.
-fn append_bg_color(output: &mut String, pending_codes: &[u8], color: &Color) {
-    use crate::cell::ColorKind;
-
-    // First emit any pending codes
-    if !pending_codes.is_empty() {
-        output.push_str("\x1b[");
-        for (i, code) in pending_codes.iter().enumerate() {
-            if i > 0 {
-                output.push(';');
-            }
-            output.push_str(&code.to_string());
-        }
-        output.push('m');
-    }
-
-    match color.kind {
-        ColorKind::Default => {
-            output.push_str("\x1b[49m");
-        }
-        ColorKind::Indexed => {
-            if color.r < 8 {
-                output.push_str(&format!("\x1b[{}m", 40 + color.r));
-            } else if color.r < 16 {
-                output.push_str(&format!("\x1b[{}m", 100 + color.r - 8));
-            } else {
-                output.push_str(&format!("\x1b[48;5;{}m", color.r));
-            }
-        }
-        ColorKind::Rgb => {
-            output.push_str(&format!("\x1b[48;2;{};{};{}m", color.r, color.g, color.b));
-        }
-    }
 }

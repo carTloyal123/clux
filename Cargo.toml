@@ -73,7 +73,7 @@ path = "src/bin/clux/main.rs"
 
 [[bin]]
 name = "clux-server"
-path = "src/bin/clux-server.rs"
+path = "src/bin/clux-server/main.rs"
 
 [profile.release]
 lto = true

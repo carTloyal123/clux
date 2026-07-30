@@ -180,71 +180,8 @@ impl Terminal {
                 self.cursor.restore();
             }
             // Private mode set/reset
-            ('h', true) => {
-                for &param in &params {
-                    match param {
-                        1 => {
-                            // DECCKM - Application Cursor Keys
-                        }
-                        7 => {
-                            // DECAWM - Auto-wrap mode
-                            self.auto_wrap = true;
-                        }
-                        12 => {
-                            // Cursor blink
-                        }
-                        25 => {
-                            // DECTCEM - Show cursor
-                            self.cursor.visible = true;
-                        }
-                        1000 => {
-                            // X11 mouse reporting (normal tracking mode)
-                            self.mouse_mode = 1000;
-                        }
-                        1002 => {
-                            // X11 mouse reporting (button-event tracking)
-                            self.mouse_mode = 1002;
-                        }
-                        1003 => {
-                            // X11 mouse reporting (any-event tracking)
-                            self.mouse_mode = 1003;
-                        }
-                        1006 => {
-                            // SGR mouse encoding
-                            self.sgr_mouse = true;
-                        }
-                        1049 => {
-                            // Alternate screen buffer
-                            self.enter_alt_screen();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            ('l', true) => {
-                for &param in &params {
-                    match param {
-                        7 => {
-                            self.auto_wrap = false;
-                        }
-                        25 => {
-                            self.cursor.visible = false;
-                        }
-                        1000 | 1002 | 1003 => {
-                            // Disable mouse tracking
-                            self.mouse_mode = 0;
-                        }
-                        1006 => {
-                            // Disable SGR mouse encoding
-                            self.sgr_mouse = false;
-                        }
-                        1049 => {
-                            self.exit_alt_screen();
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            ('h', true) => self.set_private_mode(true, &params),
+            ('l', true) => self.set_private_mode(false, &params),
             _ => {}
         }
     }
