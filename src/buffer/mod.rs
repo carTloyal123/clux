@@ -8,7 +8,7 @@
 //! This replaces the previous split between a mutable fixed grid and an immutable
 //! ring of history lines, which could not reflow history on resize, could not
 //! carry a selection across the boundary, and needed a trait to be read
-//! uniformly. See docs/PAGED_BUFFER.md.
+//! uniformly.
 
 mod addressing;
 mod edit;

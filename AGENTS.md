@@ -138,16 +138,14 @@ remote-SSH tests use it as a stand-in for `ssh -L` socket forwarding. Releases s
 `clux` and `clux-server` only.
 
 `src/selection.rs` and `src/clipboard.rs` are now both live: mouse selection and
-OSC 52 copy run in the client, with no server round-trip. See
-[docs/SELECTION.md](docs/SELECTION.md).
+OSC 52 copy run in the client, with no server round-trip.
 
 ## Storage model: one buffer, screen as a window
 
 All terminal content lives in `src/buffer/`: a deque of fixed-width pages, where the
 last `screen_rows` rows are the active screen and everything before is history. There
 is no separate grid or scrollback - that split is what made resize unable to re-wrap
-history and forced a trait to read rows uniformly. See
-[docs/PAGED_BUFFER.md](docs/PAGED_BUFFER.md).
+history and forced a trait to read rows uniformly.
 
 Rules that keep it that way:
 

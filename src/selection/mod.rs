@@ -3,7 +3,6 @@
 //! Coordinates are client screen coordinates: the client owns selection, because
 //! it owns the composited screen and the mouse events. Text extraction lives with
 //! the screen buffer (`client::screen`), which knows pane rects and soft wraps.
-//! See docs/SELECTION.md.
 
 // Word/Line modes and find_word_bounds land with double- and triple-click.
 

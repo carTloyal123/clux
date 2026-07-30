@@ -1,7 +1,6 @@
 //! Scrollback and viewport invariants
 //!
-//! Behaviour that must survive the paged-buffer migration
-//! (docs/PAGED_BUFFER.md).
+//! Behaviour that must survive the paged-buffer migration.
 
 mod common;
 

@@ -2,8 +2,7 @@
 //!
 //! When the focused pane has enabled mouse reporting, the client re-encodes the
 //! host terminal's mouse events as SGR (mode 1006) sequences and sends them to
-//! the pty. Selection gestures never reach here - see [`crate::client::screen`]
-//! and docs/SELECTION.md.
+//! the pty. Selection gestures never reach here - see [`crate::client::screen`].
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 

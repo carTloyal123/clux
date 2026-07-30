@@ -1,7 +1,7 @@
 //! Shared helpers for the storage invariant tests.
 //!
 //! Public surface only - no grid or scrollback internals - so these stay
-//! meaningful across the paged-buffer migration (docs/PAGED_BUFFER.md).
+//! meaningful across the paged-buffer migration.
 
 #![allow(dead_code)]
 
