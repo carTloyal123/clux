@@ -149,8 +149,12 @@ mod test_support;
 #[cfg(test)]
 mod ansi_tests;
 #[cfg(test)]
+mod detect_tests;
+#[cfg(test)]
 mod link_tests;
 #[cfg(test)]
 mod selection_tests;
+#[cfg(test)]
+mod update_tests;
 #[cfg(test)]
 mod tests;

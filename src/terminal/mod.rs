@@ -25,6 +25,12 @@ mod perform;
 mod resize;
 mod sgr;
 #[cfg(test)]
+mod resize_tests;
+#[cfg(test)]
+mod scroll_tests;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 mod writing;
 
