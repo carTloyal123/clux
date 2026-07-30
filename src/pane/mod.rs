@@ -144,7 +144,9 @@ impl Pane {
 }
 
 mod layout;
+mod navigation;
 #[cfg(test)]
 mod tests;
+mod tree;
 
 pub use layout::*;

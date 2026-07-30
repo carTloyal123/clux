@@ -35,3 +35,6 @@ pub fn print_lines(term: &mut Terminal, count: usize) {
         feed(term, format!("line {}\r\n", i).as_bytes());
     }
 }
+
+pub mod harness;
+pub mod ssh;

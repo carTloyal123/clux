@@ -1,5 +1,7 @@
 //! Remote bootstrap tests.
 
+use super::bootstrap::*;
+use super::install::*;
 use super::*;
 
 #[test]
