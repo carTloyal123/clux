@@ -20,9 +20,6 @@ pub enum ProtocolError {
 
     #[error("Connection closed")]
     ConnectionClosed,
-
-    #[error("Protocol version mismatch: client={client}, server={server}")]
-    VersionMismatch { client: u32, server: u32 },
 }
 
 /// Result type for protocol operations.

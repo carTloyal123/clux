@@ -121,11 +121,6 @@ impl Terminal {
         self.buffer.history_rows()
     }
 
-    /// Check if this terminal wants mouse events.
-    pub fn wants_mouse(&self) -> bool {
-        self.mouse_mode != 0
-    }
-
     /// Get the mouse tracking mode (0, 1000, 1002, or 1003).
     pub fn mouse_mode(&self) -> u16 {
         self.mouse_mode

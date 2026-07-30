@@ -52,11 +52,6 @@ impl PaneManager {
         })
     }
 
-    /// Get the focused pane.
-    pub fn focused_pane(&self) -> Option<&Pane> {
-        self.panes.get(&self.focused)
-    }
-
     /// Get the focused pane mutably.
     pub fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
         self.panes.get_mut(&self.focused)

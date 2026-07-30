@@ -62,8 +62,10 @@ reads the buffer's viewport, whatever it is currently showing.
 
 ## Known gaps
 
-- **No search.** `Scrollback::search` exists and is untested against the view.
-- **`ScrollbackLine::to_string`/`extract_text`** are the last unused pieces of the
-  scrollback API; they belong to search and to cross-boundary selection.
+- **No search.** There is no way to search history yet; it would run over the
+  buffer's rows the same way link resolution does.
+- **Selection stops at the viewport edge.** A drag cannot span the boundary
+  between what is on screen and what is scrolled above it - see
+  [SELECTION.md](SELECTION.md).
 - **Nothing outstanding on reflow.** Resizing re-wraps history along with the
   screen, and the cursor keeps its character.

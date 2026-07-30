@@ -63,9 +63,6 @@ pub enum ServerError {
     #[error("Session error: {0}")]
     Session(#[from] crate::session::SessionError),
 
-    #[error("Server already running at {0}")]
-    AlreadyRunning(PathBuf),
-
     #[error("Failed to create socket directory: {0}")]
     SocketDir(io::Error),
 }

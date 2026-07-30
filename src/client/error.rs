@@ -13,9 +13,6 @@ pub enum ClientError {
     #[error("Protocol error: {0}")]
     Protocol(#[from] crate::protocol::ProtocolError),
 
-    #[error("Server not running and failed to start")]
-    ServerNotRunning,
-
     #[error("Connection failed after {0} attempts")]
     ConnectionFailed(u32),
 
@@ -30,9 +27,6 @@ pub enum ClientError {
 
     #[error("Unexpected response: {0:?}")]
     UnexpectedResponse(ServerMessage),
-
-    #[error("Disconnected: {0}")]
-    Disconnected(String),
 
     #[error("ssh is required for --remote mode but was not found in PATH")]
     SshUnavailable,

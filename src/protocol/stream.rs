@@ -146,11 +146,6 @@ impl MessageWriter {
     pub fn has_pending(&self) -> bool {
         self.written < self.buffer.len()
     }
-
-    /// Get the number of bytes pending to be written.
-    pub fn pending_len(&self) -> usize {
-        self.buffer.len() - self.written
-    }
 }
 
 impl Default for MessageWriter {
