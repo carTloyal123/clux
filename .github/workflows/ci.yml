@@ -205,6 +205,80 @@ jobs:
           path: clux-server-v${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  # macOS bottles for the Homebrew tap: each archive holds both binaries, since
+  # the client spawns clux-server as a sibling. Built natively per arch.
+  build-macos:
+    name: Build ${{ matrix.target }}
+    if: >-
+      ${{
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor != 'github-actions[bot]' &&
+        needs.prepare-release.outputs.should_release == 'true'
+      }}
+    needs:
+      - prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build clux and clux-server
+        run: cargo build --release --bin clux --bin clux-server --target ${{ matrix.target }}
+
+      - name: Package release artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          archive="clux-v${VERSION}-${TARGET}.tar.gz"
+          staging_dir="$(mktemp -d)"
+
+          for bin in clux clux-server; do
+            src="target/${TARGET}/release/${bin}"
+            if [[ ! -f "${src}" ]]; then
+              echo "Missing release binary at ${src}" >&2
+              exit 1
+            fi
+            cp "${src}" "${staging_dir}/${bin}"
+            chmod +x "${staging_dir}/${bin}"
+          done
+
+          tar -czf "${archive}" -C "${staging_dir}" clux clux-server
+
+          contents="$(tar -tzf "${archive}" | sort | tr '\n' ' ')"
+          if [[ "${contents}" != "clux clux-server " ]]; then
+            echo "Unexpected archive contents in ${archive}: ${contents}" >&2
+            exit 1
+          fi
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clux-${{ matrix.target }}
+          path: clux-v${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
   publish-release:
     name: Publish release
     if: >-
@@ -216,6 +290,7 @@ jobs:
       }}
     needs:
       - build-release-targets
+      - build-macos
       - prepare-release
     runs-on: ubuntu-latest
     permissions:
@@ -238,9 +313,11 @@ jobs:
             mv "${file}" release/
           done
 
+          # 2 Linux clux-server + 2 macOS clux bottles.
           count="$(find release -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')"
-          if [[ "${count}" != "2" ]]; then
-            echo "Expected 2 release archives, found ${count}" >&2
+          if [[ "${count}" != "4" ]]; then
+            echo "Expected 4 release archives, found ${count}" >&2
+            find release -maxdepth 1 -name '*.tar.gz' >&2
             exit 1
           fi
 
